@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VaultGuard</string>
+    <string name="disguise_calculator">Calculator</string>
+    <string name="disguise_notes">Quick Notes</string>
+    <string name="disguise_weather">Weather</string>
+    <string name="disguise_clock">Timer</string>
+
+    <string name="accessibility_service_label">VaultGuard App Limiter</string>
+    <string name="accessibility_service_description">Detects when a limited app is opened to show the Suspended screen, re-arms the lock when you exit the app, protects against unauthorized uninstallation, and detects your secret wake word in search bars or the phone dialer when hidden.</string>
+    <string name="notification_listener_label">VaultGuard Silent Notifications</string>
+    <string name="device_admin_label">VaultGuard Uninstall Protection</string>
+    <string name="device_admin_description">Prevents unauthorized uninstallation or tampering of VaultGuard without the Admin password.</string>
+    <string name="stealth_search_hint">Enter stealth wake word</string>
+
+    <!-- Setup & Auth -->
+    <string name="setup_title">Setup</string>
+    <string name="admin_password_label">Admin Password</string>
+    <string name="confirm_password_label">Confirm Password</string>
+    <string name="wake_word_label">Wake Word</string>
+    <string name="btn_activate_vault">Activate</string>
+    <string name="unlock_vault_title">Admin Unlock</string>
+    <string name="btn_unlock">Unlock</string>
+
+    <!-- Navigation -->
+    <string name="nav_guard">Guard</string>
+    <string name="nav_apps">Apps</string>
+    <string name="nav_vault">Vault</string>
+    <string name="nav_disguise">Disguise</string>
+    <string name="nav_security">Security</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Redirect Gate -->
+    <string name="gate_limited_title">App Access Limited</string>
+    <string name="gate_ask_unlimit">Do you want to unlimit this app?</string>
+    <string name="gate_stay_focused">Go Back Home</string>
+    <string name="gate_unlimit_action">Unlimit App</string>
+    <string name="gate_enter_admin_password">Enter Admin Password to Unlimit</string>
+    <string name="gate_confirm_unlimit">Verify &amp; Open App</string>
+</resources>

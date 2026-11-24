@@ -1,0 +1,6 @@
+{
+  "name": "VaultGuard",
+  "description": "Admin-protected app limiter with redirect password gate, launcher disguise modes, uninstall protection, and stealth wake-word access.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-.]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidUserProfile(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+             (!('email' in data) || data.email == null || (data.email is string && data.email.size() <= 200)) &&
+             (!('photoUrl' in data) || data.photoUrl == null || (data.photoUrl is string && data.photoUrl.size() <= 500)) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidLimitedApp(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.packageName is string && data.packageName.size() >= 1 && data.packageName.size() <= 200 &&
+             data.appName is string && data.appName.size() >= 1 && data.appName.size() <= 120 &&
+             data.limited is bool &&
+             data.blockCount is int && data.blockCount >= 0 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidAppRelease(data) {
+      return data.publishedByUid is string && data.publishedByUid.size() >= 1 && data.publishedByUid.size() <= 128 &&
+             data.packageName is string && data.packageName.size() >= 1 && data.packageName.size() <= 200 &&
+             data.versionCode is int && data.versionCode >= 1 &&
+             data.versionName is string && data.versionName.size() >= 1 && data.versionName.size() <= 40 &&
+             data.releaseNotes is string && data.releaseNotes.size() <= 2000 &&
+             data.downloadUrl is string && data.downloadUrl.size() >= 12 && data.downloadUrl.size() <= 1000 && data.downloadUrl.matches('^https://.*') &&
+             data.signingSha256 is string && data.signingSha256.size() == 64 && data.signingSha256.matches('^[0-9a-f]{64}$') &&
+             data.apkSizeBytes is int && data.apkSizeBytes > 0 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       request.auth.uid == userId &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().keys().hasAll(['userId', 'displayName', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'displayName', 'email', 'photoUrl', 'createdAt', 'updatedAt']) &&
+                       isValidUserProfile(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(userId) &&
+                       request.auth.uid == userId &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidUserProfile(incoming()) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'photoUrl', 'updatedAt']);
+
+      allow delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+
+      match /limited_apps/{ruleId} {
+        allow get: if isSignedIn() && isValidId(ruleId) && request.auth.uid == userId;
+        allow list: if isSignedIn() && request.auth.uid == userId;
+
+        allow create: if isSignedIn() &&
+                         isValidId(ruleId) &&
+                         request.auth.uid == userId &&
+                         incoming().userId == request.auth.uid &&
+                         incoming().keys().hasAll(['userId', 'packageName', 'appName', 'limited', 'blockCount', 'createdAt', 'updatedAt']) &&
+                         incoming().keys().hasOnly(['userId', 'packageName', 'appName', 'limited', 'blockCount', 'createdAt', 'updatedAt']) &&
+                         isValidLimitedApp(incoming());
+
+        allow update: if isSignedIn() &&
+                         isValidId(ruleId) &&
+                         request.auth.uid == userId &&
+                         incoming().userId == existing().userId &&
+                         incoming().packageName == existing().packageName &&
+                         incoming().createdAt == existing().createdAt &&
+                         isValidLimitedApp(incoming()) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['appName', 'limited', 'blockCount', 'updatedAt']);
+
+        allow delete: if isSignedIn() && isValidId(ruleId) && request.auth.uid == userId;
+      }
+    }
+
+    match /app_releases/{releaseId} {
+      allow get: if isSignedIn() && isValidId(releaseId);
+      allow list: if isSignedIn();
+
+      allow create: if isSignedIn() &&
+                       isValidId(releaseId) &&
+                       incoming().publishedByUid == request.auth.uid &&
+                       incoming().keys().hasAll(['publishedByUid', 'packageName', 'versionCode', 'versionName', 'releaseNotes', 'downloadUrl', 'signingSha256', 'apkSizeBytes', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['publishedByUid', 'packageName', 'versionCode', 'versionName', 'releaseNotes', 'downloadUrl', 'signingSha256', 'apkSizeBytes', 'createdAt', 'updatedAt']) &&
+                       isValidAppRelease(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(releaseId) &&
+                       existing().publishedByUid == request.auth.uid &&
+                       incoming().publishedByUid == existing().publishedByUid &&
+                       incoming().packageName == existing().packageName &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidAppRelease(incoming()) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['versionCode', 'versionName', 'releaseNotes', 'downloadUrl', 'signingSha256', 'apkSizeBytes', 'updatedAt']);
+
+      allow delete: if isSignedIn() && isValidId(releaseId) && existing().publishedByUid == request.auth.uid;
+    }
+  }
+}

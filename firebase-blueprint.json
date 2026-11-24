@@ -1,0 +1,151 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Google-authenticated VaultGuard admin account profile.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the account owner."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name from Google Sign-In."
+        },
+        "email": {
+          "type": "string",
+          "description": "Email address from Google Sign-In."
+        },
+        "photoUrl": {
+          "type": "string",
+          "description": "Optional profile photo URL."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when account was first registered."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was last updated."
+        }
+      },
+      "required": ["userId", "displayName", "createdAt", "updatedAt"]
+    },
+    "CloudLimitedApp": {
+      "title": "CloudLimitedApp",
+      "description": "Cloud-synced limited app rule owned by the authenticated user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID."
+        },
+        "packageName": {
+          "type": "string",
+          "description": "Android package identifier."
+        },
+        "appName": {
+          "type": "string",
+          "description": "Human-readable app label."
+        },
+        "limited": {
+          "type": "boolean",
+          "description": "Whether the app is currently limited."
+        },
+        "blockCount": {
+          "type": "integer",
+          "description": "Cumulative redirect count."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of rule creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last rule update."
+        }
+      },
+      "required": ["userId", "packageName", "appName", "limited", "blockCount", "createdAt", "updatedAt"]
+    },
+    "AppRelease": {
+      "title": "AppRelease",
+      "description": "Published OTA APK release metadata stored in Firestore and backed by Firebase Storage.",
+      "type": "object",
+      "properties": {
+        "publishedByUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the developer/admin who published the release."
+        },
+        "packageName": {
+          "type": "string",
+          "description": "Android package ID of the release APK."
+        },
+        "versionCode": {
+          "type": "integer",
+          "description": "Monotonically increasing Android versionCode."
+        },
+        "versionName": {
+          "type": "string",
+          "description": "Human-readable versionName (e.g., 1.2.0)."
+        },
+        "releaseNotes": {
+          "type": "string",
+          "description": "Changelog / release notes shown to users."
+        },
+        "downloadUrl": {
+          "type": "string",
+          "description": "HTTPS download URL of the signed APK in Firebase Storage."
+        },
+        "signingSha256": {
+          "type": "string",
+          "description": "Lowercase 64-char hex SHA-256 signing certificate fingerprint."
+        },
+        "apkSizeBytes": {
+          "type": "integer",
+          "description": "Size of the signed APK file in bytes."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the release was published."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the release metadata was updated."
+        }
+      },
+      "required": [
+        "publishedByUid",
+        "packageName",
+        "versionCode",
+        "versionName",
+        "releaseNotes",
+        "downloadUrl",
+        "signingSha256",
+        "apkSizeBytes",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Authenticated user profile document."
+    },
+    "/users/{userId}/limited_apps/{ruleId}": {
+      "schema": { "$ref": "#/entities/CloudLimitedApp" },
+      "description": "User-scoped limited app rules backed up to Firestore."
+    },
+    "/app_releases/{releaseId}": {
+      "schema": { "$ref": "#/entities/AppRelease" },
+      "description": "Signed OTA app release metadata readable by authenticated users and writable by authenticated publishers."
+    }
+  }
+}

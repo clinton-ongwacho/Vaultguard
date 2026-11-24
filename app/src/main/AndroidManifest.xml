@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".VaultGuardApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:manageSpaceActivity=".GatekeeperActivity"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MyApplication">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.MyApplication"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Default Launcher Alias -->
+        <activity-alias
+            android:name=".LauncherDefault"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_round"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Disguise Aliases -->
+        <activity-alias
+            android:name=".LauncherCalculator"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@drawable/ic_disguise_calculator"
+            android:label="@string/disguise_calculator"
+            android:roundIcon="@drawable/ic_disguise_calculator"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherNotes"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@drawable/ic_disguise_notes"
+            android:label="@string/disguise_notes"
+            android:roundIcon="@drawable/ic_disguise_notes"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherWeather"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@drawable/ic_disguise_weather"
+            android:label="@string/disguise_weather"
+            android:roundIcon="@drawable/ic_disguise_weather"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherClock"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@drawable/ic_disguise_clock"
+            android:label="@string/disguise_clock"
+            android:roundIcon="@drawable/ic_disguise_clock"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Redirect & Password Gate Activity (isolated from Recents / VaultGuard task) -->
+        <activity
+            android:name=".GatekeeperActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.MyApplication"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Stealth Search Intent Activity -->
+        <activity
+            android:name=".StealthSearchActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:theme="@style/Theme.MyApplication">
+            <intent-filter>
+                <action android:name="android.intent.action.SEARCH" />
+            </intent-filter>
+            <meta-data
+                android:name="android.app.searchable"
+                android:resource="@xml/searchable" />
+        </activity>
+
+        <!-- App Limiter & Wake-Word Accessibility Service -->
+        <service
+            android:name=".service.AppGuardAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Notification Blocker Service for Restricted Apps -->
+        <service
+            android:name=".service.VaultNotificationListenerService"
+            android:exported="true"
+            android:label="@string/notification_listener_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+
+        <!-- Device Admin Receiver for Uninstall Protection -->
+        <receiver
+            android:name=".service.VaultDeviceAdminReceiver"
+            android:description="@string/device_admin_description"
+            android:exported="true"
+            android:label="@string/device_admin_label"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin_policies" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                <action android:name="android.app.action.DEVICE_ADMIN_DISABLE_REQUESTED" />
+                <action android:name="android.app.action.DEVICE_ADMIN_DISABLED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Phone Dialer Secret Code Receiver (*#*#82858#*#*) -->
+        <receiver
+            android:name=".service.SecretCodeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SECRET_CODE" />
+                <data
+                    android:host="82858"
+                    android:scheme="android_secret_code" />
+            </intent-filter>
+        </receiver>
+
+        <!-- FileProvider for verified OTA APK installation -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+
+</manifest>
