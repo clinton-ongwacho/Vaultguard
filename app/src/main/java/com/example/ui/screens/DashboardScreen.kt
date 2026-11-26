@@ -64,6 +64,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -82,7 +83,6 @@ import com.example.ui.VaultUiState
 import com.example.ui.components.AppDrawableIcon
 import com.example.ui.components.SystemIntegrityBanner
 import kotlinx.coroutines.delay
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -102,6 +102,7 @@ fun DashboardScreen(
     onDismissUpdateBanner: () -> Unit,
     onInspectApkForPublish: (Uri) -> Unit,
     onPublishOtaUpdate: (releaseNotes: String, versionCodeInput: String, versionNameInput: String) -> Unit,
+    onDecryptSessionPhotoBytes: suspend (String?) -> ByteArray? = { null },
     onSuppressNextBackgroundLock: () -> Unit = {},
 ) {
     val protectedApps = remember(state.apps) {
@@ -522,6 +523,7 @@ fun DashboardScreen(
                         Column {
                             EventListItemRow(
                                 event = event,
+                                onDecryptSessionPhotoBytes = onDecryptSessionPhotoBytes,
                                 onViewPhoto = { inspectedPhotoEvent = event },
                             )
                             if (index < state.recentEvents.lastIndex) {
@@ -539,6 +541,7 @@ fun DashboardScreen(
     inspectedPhotoEvent?.let { selectedEvent ->
         SessionPhotoViewerDialog(
             event = selectedEvent,
+            onDecryptSessionPhotoBytes = onDecryptSessionPhotoBytes,
             onDismiss = { inspectedPhotoEvent = null },
         )
     }
@@ -561,13 +564,18 @@ fun DashboardScreen(
 @Composable
 private fun EventListItemRow(
     event: AccessEventEntity,
+    onDecryptSessionPhotoBytes: suspend (String?) -> ByteArray?,
     onViewPhoto: () -> Unit,
 ) {
     val formatter = SimpleDateFormat("MMM d, HH:mm", Locale.getDefault())
     val timeStr = formatter.format(Date(event.timestampMillis))
     val isAlert = event.eventType.contains("FAILED") || event.eventType.contains("REDIRECT") || event.eventType.contains("SUSPENDED")
-    val photoFile = remember(event.photoPath) {
-        event.photoPath?.let { path -> File(path).takeIf { it.exists() && it.length() > 0L } }
+    val photoBytes by produceState<ByteArray?>(initialValue = null, event.photoPath) {
+        value = if (!event.photoPath.isNullOrBlank()) {
+            onDecryptSessionPhotoBytes(event.photoPath)
+        } else {
+            null
+        }
     }
 
     Row(
@@ -602,7 +610,7 @@ private fun EventListItemRow(
             )
         }
 
-        if (photoFile != null) {
+        if (photoBytes != null) {
             Spacer(modifier = Modifier.size(10.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -619,7 +627,7 @@ private fun EventListItemRow(
                     .testTag("session_photo_view_${event.id}"),
             ) {
                 AsyncImage(
-                    model = photoFile,
+                    model = photoBytes,
                     contentDescription = "Session photo",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
@@ -640,12 +648,17 @@ private fun EventListItemRow(
 @Composable
 private fun SessionPhotoViewerDialog(
     event: AccessEventEntity,
+    onDecryptSessionPhotoBytes: suspend (String?) -> ByteArray?,
     onDismiss: () -> Unit,
 ) {
     val formatter = SimpleDateFormat("MMM d, yyyy • HH:mm:ss", Locale.getDefault())
     val timeStr = formatter.format(Date(event.timestampMillis))
-    val photoFile = remember(event.photoPath) {
-        event.photoPath?.let { File(it) }
+    val photoBytes by produceState<ByteArray?>(initialValue = null, event.photoPath) {
+        value = if (!event.photoPath.isNullOrBlank()) {
+            onDecryptSessionPhotoBytes(event.photoPath)
+        } else {
+            null
+        }
     }
 
     Dialog(onDismissRequest = onDismiss) {
@@ -675,9 +688,9 @@ private fun SessionPhotoViewerDialog(
                     )
                 }
 
-                if (photoFile != null && photoFile.exists()) {
+                if (photoBytes != null) {
                     AsyncImage(
-                        model = photoFile,
+                        model = photoBytes,
                         contentDescription = "Captured session photo",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier

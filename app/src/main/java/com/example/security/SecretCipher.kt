@@ -12,18 +12,28 @@ import javax.crypto.spec.GCMParameterSpec
 object SecretCipher {
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val KEY_ALIAS = "vaultguard_sq_aes_key"
+    private const val CONFIG_KEY_ALIAS = "vaultguard_config_aes_key"
+    private const val CONFIG_PREFIX = "vgc1:"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_TAG_LENGTH_BITS = 128
 
-    private fun getOrCreateSecretKey(): SecretKey? {
+    fun isAndroidKeyStoreAvailable(): Boolean {
+        return runCatching {
+            KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        }.isSuccess
+    }
+
+    fun isEncryptedConfigSecret(stored: String): Boolean = stored.startsWith(CONFIG_PREFIX)
+
+    private fun getOrCreateSecretKey(alias: String = KEY_ALIAS): SecretKey? {
         return runCatching {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            val existing = keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+            val existing = keyStore.getKey(alias, null) as? SecretKey
             if (existing != null) return@runCatching existing
 
             val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
             val spec = KeyGenParameterSpec.Builder(
-                KEY_ALIAS,
+                alias,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
             )
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -36,7 +46,45 @@ object SecretCipher {
     }
 
     fun encryptAnswer(plainText: String): String {
-        val secretKey = getOrCreateSecretKey() ?: return ""
+        val secretKey = getOrCreateSecretKey(KEY_ALIAS) ?: return ""
+        return encryptRaw(plainText, secretKey)
+    }
+
+    fun decryptAnswer(payload: String): String {
+        if (payload.isBlank() || !payload.contains(':')) return ""
+        val secretKey = getOrCreateSecretKey(KEY_ALIAS) ?: return ""
+        return decryptRaw(payload, secretKey)
+    }
+
+    fun encryptConfigSecret(plainText: String): String {
+        if (plainText.isEmpty()) return ""
+        if (plainText.startsWith(CONFIG_PREFIX)) return plainText
+        val secretKey = getOrCreateSecretKey(CONFIG_KEY_ALIAS) ?: return plainText
+        return encryptConfigSecretWithKey(plainText, secretKey)
+    }
+
+    fun decryptConfigSecret(stored: String): String {
+        if (stored.isEmpty()) return ""
+        if (!stored.startsWith(CONFIG_PREFIX)) return stored
+        val secretKey = getOrCreateSecretKey(CONFIG_KEY_ALIAS) ?: return ""
+        return decryptConfigSecretWithKey(stored, secretKey)
+    }
+
+    fun encryptConfigSecretWithKey(plainText: String, secretKey: SecretKey): String {
+        if (plainText.isEmpty()) return ""
+        if (plainText.startsWith(CONFIG_PREFIX)) return plainText
+        val raw = encryptRaw(plainText, secretKey)
+        return if (raw.isNotEmpty()) "$CONFIG_PREFIX$raw" else plainText
+    }
+
+    fun decryptConfigSecretWithKey(stored: String, secretKey: SecretKey): String {
+        if (stored.isEmpty()) return ""
+        if (!stored.startsWith(CONFIG_PREFIX)) return stored
+        val raw = stored.removePrefix(CONFIG_PREFIX)
+        return decryptRaw(raw, secretKey)
+    }
+
+    private fun encryptRaw(plainText: String, secretKey: SecretKey): String {
         return runCatching {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.ENCRYPT_MODE, secretKey)
@@ -48,9 +96,8 @@ object SecretCipher {
         }.getOrDefault("")
     }
 
-    fun decryptAnswer(payload: String): String {
+    private fun decryptRaw(payload: String, secretKey: SecretKey): String {
         if (payload.isBlank() || !payload.contains(':')) return ""
-        val secretKey = getOrCreateSecretKey() ?: return ""
         return runCatching {
             val parts = payload.split(':', limit = 2)
             if (parts.size != 2) return@runCatching ""

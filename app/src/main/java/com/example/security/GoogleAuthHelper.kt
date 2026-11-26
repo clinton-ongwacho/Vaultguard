@@ -8,6 +8,7 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import com.example.BuildConfig
 import com.example.R
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
@@ -100,12 +101,16 @@ object GoogleAuthHelper {
                 onError("Unexpected credential type received.")
             }
         } catch (e: GetCredentialCancellationException) {
-            Log.w(TAG, "Google Sign-In cancelled or dismissed: ${e.message}", e)
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "Google Sign-In cancelled or dismissed")
+            }
             onCancelled()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Google Sign-In failed", e)
+            if (BuildConfig.DEBUG) {
+                Log.e(TAG, "Google Sign-In failed: ${e::class.java.simpleName}")
+            }
             onError(e.localizedMessage ?: "Google Sign-In failed.")
         }
     }
@@ -116,7 +121,9 @@ object GoogleAuthHelper {
                 CredentialManager.create(context)
                     .clearCredentialState(ClearCredentialStateRequest())
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to clear credential state: ${e.message}")
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "Failed to clear credential state: ${e::class.java.simpleName}")
+                }
             } finally {
                 Firebase.auth.signOut()
                 onComplete()

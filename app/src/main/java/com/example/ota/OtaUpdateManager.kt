@@ -62,11 +62,22 @@ class OtaUpdateManager(
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    companion object {
+        private const val MAX_APK_DOWNLOAD_BYTES = 200L * 1024L * 1024L
+    }
+
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
+        .addNetworkInterceptor { chain ->
+            val requestUrl = chain.request().url.toString()
+            if (!ApkSecurityVerifier.isValidOtaDownloadUrl(requestUrl)) {
+                throw java.io.IOException("Blocked unsafe APK download URL or redirect target.")
+            }
+            chain.proceed(chain.request())
+        }
         .build()
 
     private val _state = MutableStateFlow(
@@ -106,6 +117,7 @@ class OtaUpdateManager(
             candidateHashes = setOf(release.signingSha256),
             expectedReleaseHash = release.signingSha256,
         )
+        val urlTrusted = release == null || ApkSecurityVerifier.isValidOtaDownloadUrl(release.downloadUrl)
 
         val previousVersion = _state.value.latestRelease?.versionCode
         val cleanBannerDismiss = if (release?.versionCode != previousVersion) {
@@ -124,13 +136,15 @@ class OtaUpdateManager(
                 installedVersionName = ApkSecurityVerifier.getInstalledVersionName(appContext),
                 installedSigningSha256 = installedHashes.firstOrNull().orEmpty(),
                 latestRelease = release,
-                hasUpdate = isNewer,
+                hasUpdate = isNewer && signingTrusted && urlTrusted,
                 updateBannerDismissed = cleanBannerDismiss,
                 verifiedApkPath = cleanVerifiedApk,
-                updateError = if (isNewer && !signingTrusted) {
-                    "Latest release v${release?.versionName} has an untrusted signing key and cannot be installed."
-                } else {
-                    current.updateError
+                updateError = when {
+                    isNewer && !signingTrusted ->
+                        "Latest release v${release?.versionName} has an untrusted signing key and cannot be installed."
+                    isNewer && !urlTrusted ->
+                        "Latest release v${release?.versionName} has an invalid download URL and was blocked."
+                    else -> current.updateError
                 },
             )
         }
@@ -208,8 +222,8 @@ class OtaUpdateManager(
             return
         }
 
-        if (!release.downloadUrl.startsWith("https://")) {
-            _state.update { it.copy(updateError = "Refusing insecure non-HTTPS APK URL.") }
+        if (!ApkSecurityVerifier.isValidOtaDownloadUrl(release.downloadUrl)) {
+            _state.update { it.copy(updateError = "Refusing unsafe or non-HTTPS APK URL.") }
             return
         }
 
@@ -244,6 +258,9 @@ class OtaUpdateManager(
                     }
                     val body = response.body ?: throw IllegalStateException("Empty download response.")
                     val expectedLen = body.contentLength().takeIf { it > 0L } ?: release.apkSizeBytes
+                    if (expectedLen > MAX_APK_DOWNLOAD_BYTES) {
+                        throw IllegalStateException("APK exceeds maximum allowed size.")
+                    }
 
                     body.byteStream().use { input ->
                         FileOutputStream(partFile).use { output ->
@@ -253,8 +270,11 @@ class OtaUpdateManager(
                             while (true) {
                                 val read = input.read(buffer)
                                 if (read == -1) break
-                                output.write(buffer, 0, read)
                                 totalRead += read
+                                if (totalRead > MAX_APK_DOWNLOAD_BYTES) {
+                                    throw IllegalStateException("APK download exceeded maximum allowed size.")
+                                }
+                                output.write(buffer, 0, read)
                                 val now = System.currentTimeMillis()
                                 if (now - lastProgressUpdate >= 120L || totalRead == expectedLen) {
                                     lastProgressUpdate = now

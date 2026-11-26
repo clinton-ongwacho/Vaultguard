@@ -19,9 +19,10 @@ class StealthSearchActivity : ComponentActivity() {
         )
 
         val query = intent?.getStringExtra(SearchManager.QUERY).orEmpty().trim()
-        val matched = query.isEmpty() ||
+        val matched = query.isNotEmpty() && (
             AppGuardRuntimeCache.matchesWakeWord(query) ||
-            AppGuardRuntimeCache.matchesDialerSecret(query)
+                AppGuardRuntimeCache.matchesDialerSecret(query)
+            )
 
         if (matched) {
             val disguise = LauncherDisguiseManager.resolveEffectiveDisguise(

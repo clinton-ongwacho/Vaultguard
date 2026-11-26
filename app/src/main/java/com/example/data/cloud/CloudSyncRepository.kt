@@ -230,7 +230,9 @@ class CloudSyncRepository(
             require(cleanPkg.isNotEmpty()) { "Package name is required." }
             require(versionCode >= 1L) { "Version code must be >= 1." }
             require(cleanVersionName.isNotEmpty()) { "Version name is required." }
-            require(cleanUrl.startsWith("https://")) { "APK download URL must use HTTPS." }
+            require(com.example.ota.ApkSecurityVerifier.isValidOtaDownloadUrl(cleanUrl)) {
+                "APK download URL must be a valid public HTTPS URL."
+            }
             require(cleanSha.matches(Regex("^[0-9a-f]{64}$"))) {
                 "Signing SHA-256 fingerprint must be 64 lowercase hex characters."
             }

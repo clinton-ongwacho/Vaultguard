@@ -44,6 +44,7 @@ class VaultGuardApp : Application() {
     override fun onCreate() {
         super.onCreate()
         appScope.launch {
+            runCatching { repository.clearUnlockedVaultTempFiles() }
             runCatching { repository.syncRuntimeCache() }
         }
         appScope.launch {

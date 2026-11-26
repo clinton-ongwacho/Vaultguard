@@ -222,6 +222,7 @@ fun VaultConsoleHost(
                                 onDismissUpdateBanner = viewModel::dismissUpdateBanner,
                                 onInspectApkForPublish = viewModel::inspectApkForPublish,
                                 onPublishOtaUpdate = viewModel::publishOtaUpdate,
+                                onDecryptSessionPhotoBytes = viewModel::decryptSessionPhotoBytes,
                                 onSuppressNextBackgroundLock = onSuppressNextBackgroundLock,
                             )
                         }

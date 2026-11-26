@@ -129,4 +129,20 @@ object VaultFileCrypto {
         }
         return baos.toByteArray()
     }
+
+    fun isEncryptedFile(file: File): Boolean {
+        if (!file.exists() || file.length() < MAGIC.size) return false
+        return runCatching {
+            FileInputStream(file).use { fis ->
+                val header = ByteArray(MAGIC.size)
+                var total = 0
+                while (total < MAGIC.size) {
+                    val read = fis.read(header, total, MAGIC.size - total)
+                    if (read <= 0) break
+                    total += read
+                }
+                total == MAGIC.size && header.contentEquals(MAGIC)
+            }
+        }.getOrDefault(false)
+    }
 }

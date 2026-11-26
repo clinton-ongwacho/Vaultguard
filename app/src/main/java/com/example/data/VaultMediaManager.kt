@@ -215,18 +215,36 @@ class VaultMediaManager(context: Context) {
         }
     }
 
+    private fun resolveVaultFile(encryptedFileName: String): File? {
+        if (!encryptedFileName.matches(Regex("^[a-zA-Z0-9._-]+\\.vgem$"))) return null
+        val root = vaultDir()
+        val candidate = File(root, encryptedFileName)
+        return runCatching {
+            val rootPrefix = root.canonicalPath + File.separator
+            if (candidate.canonicalPath.startsWith(rootPrefix)) candidate else null
+        }.getOrNull()
+    }
+
     suspend fun decryptPhotoBytes(item: VaultMediaEntity): ByteArray? = withContext(Dispatchers.IO) {
-        val encFile = File(vaultDir(), item.encryptedFileName)
+        val encFile = resolveVaultFile(item.encryptedFileName) ?: return@withContext null
         if (!encFile.exists()) return@withContext null
         runCatching { VaultFileCrypto.decryptToBytes(encFile) }.getOrNull()
     }
 
     suspend fun decryptToInAppStreamFile(item: VaultMediaEntity): File? = withContext(Dispatchers.IO) {
-        val encFile = File(vaultDir(), item.encryptedFileName)
+        val encFile = resolveVaultFile(item.encryptedFileName) ?: return@withContext null
         if (!encFile.exists()) return@withContext null
-        val ext = item.displayName.substringAfterLast('.', "").takeIf { it.isNotBlank() && it.length <= 8 }
-        val outName = if (ext != null) "${item.id}.$ext" else item.id
-        val outFile = File(streamTempDir(), outName)
+        val safeId = item.id.replace(Regex("[^a-zA-Z0-9_-]"), "_").ifBlank { "media" }
+        val ext = item.displayName.substringAfterLast('.', "").takeIf {
+            it.matches(Regex("^[a-zA-Z0-9]{1,8}$"))
+        }
+        val outName = if (ext != null) "$safeId.$ext" else safeId
+        val tempRoot = streamTempDir()
+        val outFile = File(tempRoot, outName)
+        val confined = runCatching {
+            outFile.canonicalPath.startsWith(tempRoot.canonicalPath + File.separator)
+        }.getOrDefault(false)
+        if (!confined) return@withContext null
         val ok = runCatching {
             FileInputStream(encFile).use { fis ->
                 FileOutputStream(outFile).use { fos ->
@@ -238,10 +256,16 @@ class VaultMediaManager(context: Context) {
     }
 
     suspend fun decryptToDocPreviewFile(item: VaultMediaEntity): File? = withContext(Dispatchers.IO) {
-        val encFile = File(vaultDir(), item.encryptedFileName)
+        val encFile = resolveVaultFile(item.encryptedFileName) ?: return@withContext null
         if (!encFile.exists()) return@withContext null
-        val safeName = item.displayName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-        val outFile = File(docPreviewCacheDir(), "${item.id.take(8)}_$safeName")
+        val safeId = item.id.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(12).ifBlank { "doc" }
+        val safeName = item.displayName.replace(Regex("[^a-zA-Z0-9._-]"), "_").trimStart('.').ifBlank { "document" }
+        val previewRoot = docPreviewCacheDir()
+        val outFile = File(previewRoot, "${safeId}_$safeName")
+        val confined = runCatching {
+            outFile.canonicalPath.startsWith(previewRoot.canonicalPath + File.separator)
+        }.getOrDefault(false)
+        if (!confined) return@withContext null
         val ok = runCatching {
             FileInputStream(encFile).use { fis ->
                 FileOutputStream(outFile).use { fos ->
@@ -257,8 +281,8 @@ class VaultMediaManager(context: Context) {
      * original phone gallery / storage location so media never disappears on deletion.
      */
     suspend fun deleteFromVaultReturningToGallery(item: VaultMediaEntity): Result<String> = withContext(Dispatchers.IO) {
-        val encFile = File(vaultDir(), item.encryptedFileName)
-        if (!encFile.exists()) {
+        val encFile = resolveVaultFile(item.encryptedFileName)
+        if (encFile == null || !encFile.exists()) {
             indexMutex.withLock {
                 val updated = _vaultMediaFlow.value.filterNot { it.id == item.id }
                 saveIndexToDisk(updated)
@@ -532,8 +556,9 @@ class VaultMediaManager(context: Context) {
                 for (i in 0 until array.length()) {
                     val obj = array.getJSONObject(i)
                     val encFileName = obj.getString("encryptedFileName")
-                    // Only expose items whose encrypted payload exists in private storage
-                    if (File(vaultDir(), encFileName).exists()) {
+                    val encFile = resolveVaultFile(encFileName)
+                    // Only expose items whose encrypted payload exists inside private vault storage
+                    if (encFile != null && encFile.exists()) {
                         add(
                             VaultMediaEntity(
                                 id = obj.getString("id"),

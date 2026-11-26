@@ -6,6 +6,10 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.pm.PackageInfoCompat
 import java.io.File
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.URI
 import java.security.MessageDigest
 
 data class ApkInspectResult(
@@ -39,6 +43,59 @@ object ApkSecurityVerifier {
     fun sha256Hex(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
         return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    fun isValidOtaDownloadUrl(rawUrl: String): Boolean {
+        val trimmed = rawUrl.trim()
+        if (trimmed.isEmpty() || trimmed.any { it.isWhitespace() }) return false
+        val uri = runCatching { URI(trimmed) }.getOrNull() ?: return false
+        if (!uri.scheme.equals("https", ignoreCase = true)) return false
+        if (!uri.rawUserInfo.isNullOrEmpty()) return false
+        val port = uri.port
+        if (port != -1 && port != 443) return false
+        val rawHost = uri.host?.trim()?.trim('[', ']')?.lowercase() ?: return false
+        if (rawHost.isEmpty()) return false
+
+        val blockedHosts = setOf("localhost", "ip6-localhost", "ip6-loopback")
+        if (rawHost in blockedHosts ||
+            rawHost.endsWith(".localhost") ||
+            rawHost.endsWith(".local") ||
+            rawHost.endsWith(".internal") ||
+            rawHost.endsWith(".lan") ||
+            rawHost.endsWith(".home")
+        ) {
+            return false
+        }
+
+        val isIpv4Literal = rawHost.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))
+        val isIpv6Literal = rawHost.contains(':')
+        if (isIpv4Literal || isIpv6Literal) {
+            val addr = runCatching { InetAddress.getByName(rawHost) }.getOrNull() ?: return false
+            if (addr.isAnyLocalAddress ||
+                addr.isLoopbackAddress ||
+                addr.isLinkLocalAddress ||
+                addr.isSiteLocalAddress ||
+                addr.isMulticastAddress
+            ) {
+                return false
+            }
+            if (addr is Inet4Address) {
+                val b = addr.address
+                val o0 = b[0].toInt() and 0xFF
+                val o1 = b[1].toInt() and 0xFF
+                // Block 0.0.0.0/8, 100.64.0.0/10 (CGNAT), 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, >=224.0.0.0
+                if (o0 == 0 || o0 == 10 || o0 == 127 || o0 >= 224) return false
+                if (o0 == 100 && o1 in 64..127) return false
+                if (o0 == 169 && o1 == 254) return false
+                if (o0 == 172 && o1 in 16..31) return false
+                if (o0 == 192 && o1 == 168) return false
+            } else if (addr is Inet6Address) {
+                val firstByte = addr.address[0].toInt() and 0xFF
+                // Block fc00::/7 (Unique Local Addresses)
+                if ((firstByte and 0xFE) == 0xFC) return false
+            }
+        }
+        return true
     }
 
     fun isVersionNewer(candidateCode: Long, installedCode: Long): Boolean {

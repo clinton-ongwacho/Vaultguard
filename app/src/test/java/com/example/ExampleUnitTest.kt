@@ -880,4 +880,26 @@ class ExampleUnitTest {
         assertTrue(ready.canApplyRestriction)
         assertTrue(ready.pendingSystemSteps.isEmpty())
     }
+
+    @Test
+    fun otaDownloadUrlValidation_blocksCleartextUserinfoLocalhostAndPrivateIps() {
+        assertTrue(
+            ApkSecurityVerifier.isValidOtaDownloadUrl(
+                "https://firebasestorage.googleapis.com/v0/b/demo/o/app_releases%2Fv2.apk?alt=media"
+            )
+        )
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("http://firebasestorage.googleapis.com/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://user@firebasestorage.googleapis.com/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://firebasestorage.googleapis.com:8443/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://localhost/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://server.local/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://127.0.0.1/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://169.254.169.254/latest/meta-data/"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://10.0.0.1/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://172.16.5.10/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://192.168.1.1/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://100.64.0.1/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://[::1]/v2.apk"))
+        assertFalse(ApkSecurityVerifier.isValidOtaDownloadUrl("https://[fc00::1]/v2.apk"))
+    }
 }

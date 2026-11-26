@@ -8,6 +8,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.example.BuildConfig
 import com.example.data.AppGuardRuntimeCache
 import com.example.data.InstalledAppInfo
 import com.example.data.cloud.CloudSyncRepository
@@ -426,7 +427,9 @@ class VaultViewModel(
                         .firstOrNull()
                     if (firestoreError == null && error is CancellationException) throw error
                     val rootError = firestoreError ?: error
-                    Log.w("VaultVM", "Error observing cloud rules", rootError)
+                    if (BuildConfig.DEBUG) {
+                        Log.w("VaultVM", "Error observing cloud rules: ${rootError::class.java.simpleName}")
+                    }
                     localState.update {
                         it.copy(cloudSyncError = rootError.message ?: "Cloud rule sync unavailable")
                     }
@@ -445,7 +448,10 @@ class VaultViewModel(
                         .filterIsInstance<FirebaseFirestoreException>()
                         .firstOrNull()
                     if (firestoreError == null && error is CancellationException) throw error
-                    Log.w("VaultVM", "Error observing app releases", firestoreError ?: error)
+                    if (BuildConfig.DEBUG) {
+                        val rootError = firestoreError ?: error
+                        Log.w("VaultVM", "Error observing app releases: ${rootError::class.java.simpleName}")
+                    }
                 }
                 .collect { release ->
                     otaUpdateManager.onLatestReleaseObserved(release)
@@ -670,9 +676,14 @@ class VaultViewModel(
                 }
                 refreshSystemStatus()
             } else {
+                val lockoutSec = repository.getRemainingAuthLockoutSeconds()
                 localState.update {
                     it.copy(
-                        authError = "Incorrect Admin password.",
+                        authError = if (lockoutSec > 0) {
+                            "Too many failed attempts. Try again in ${lockoutSec}s."
+                        } else {
+                            "Incorrect Admin password."
+                        },
                         failedUnlockAttempts = it.failedUnlockAttempts + 1,
                     )
                 }
@@ -832,6 +843,9 @@ class VaultViewModel(
 
     suspend fun decryptVaultDocPreviewFile(item: VaultMediaEntity): java.io.File? =
         repository.decryptVaultDocPreviewFile(item)
+
+    suspend fun decryptSessionPhotoBytes(photoPath: String?): ByteArray? =
+        repository.decryptSessionPhotoBytes(photoPath)
 
     fun saveSecurityQuestions(
         questionsAndAnswers: List<Pair<String, String>>,

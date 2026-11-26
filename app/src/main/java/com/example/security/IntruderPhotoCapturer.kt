@@ -20,6 +20,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import com.example.BuildConfig
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -31,7 +32,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -69,7 +69,9 @@ object IntruderPhotoCapturer {
 
         val started = awaitLifecycleStarted(lifecycleOwner, timeoutMs = 1_800L)
         if (!started) {
-            Log.w(TAG, "Lifecycle never reached STARTED for session photo capture")
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "Lifecycle never reached STARTED for session photo capture")
+            }
             return@withLock null
         }
 
@@ -84,24 +86,32 @@ object IntruderPhotoCapturer {
         }
 
         val photosDir = File(appContext.filesDir, "session_photos").apply { mkdirs() }
+        val noMedia = File(photosDir, ".nomedia")
+        if (!noMedia.exists()) {
+            runCatching { noMedia.createNewFile() }
+        }
         val safePkg = targetPackage.replace(Regex("[^A-Za-z0-9._-]"), "_").take(32)
 
         for (attempt in 1..2) {
             if (!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
                 break
             }
-            val outFile = File(photosDir, "session_${System.currentTimeMillis()}_$safePkg.jpg")
+            val stamp = System.currentTimeMillis()
+            val encOutFile = File(photosDir, "session_${stamp}_$safePkg.vgem")
+            val tempJpgFile = File(appContext.cacheDir, "session_cap_${stamp}_$safePkg.jpg.tmp")
             val captured = attemptSingleCapture(
                 cameraProvider = cameraProvider,
                 lifecycleOwner = lifecycleOwner,
                 selector = selector,
-                outFile = outFile,
+                encOutFile = encOutFile,
+                tempJpgFile = tempJpgFile,
                 settleDelayMs = if (attempt == 1) 240L else 420L,
             )
             if (captured != null) {
                 return@withLock captured
             }
-            runCatching { outFile.delete() }
+            runCatching { tempJpgFile.delete() }
+            runCatching { encOutFile.delete() }
             if (attempt < 2) {
                 delay(180L)
             }
@@ -113,7 +123,8 @@ object IntruderPhotoCapturer {
         cameraProvider: ProcessCameraProvider,
         lifecycleOwner: LifecycleOwner,
         selector: CameraSelector,
-        outFile: File,
+        encOutFile: File,
+        tempJpgFile: File,
         settleDelayMs: Long,
     ): String? {
         val firstFrameSeen = AtomicBoolean(false)
@@ -141,8 +152,10 @@ object IntruderPhotoCapturer {
                             )
                         )
                         firstFrameSeen.set(true)
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "Failed extracting preview analysis frame", t)
+                    } catch (_: Throwable) {
+                        if (BuildConfig.DEBUG) {
+                            Log.w(TAG, "Failed extracting preview analysis frame")
+                        }
                     } finally {
                         imageProxy.close()
                     }
@@ -160,8 +173,10 @@ object IntruderPhotoCapturer {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(lifecycleOwner, selector, imageCapture)
                 true
-            }.getOrElse { err ->
-                Log.w(TAG, "Failed to bind CameraX for session photo", err)
+            }.getOrElse {
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "Failed to bind CameraX for session photo")
+                }
                 false
             }
         }
@@ -180,9 +195,9 @@ object IntruderPhotoCapturer {
             // Brief AE/AWB settle delay after active stream begins.
             delay(settleDelayMs)
 
-            val outputOptions = ImageCapture.OutputFileOptions.Builder(outFile).build()
+            val outputOptions = ImageCapture.OutputFileOptions.Builder(tempJpgFile).build()
             val primarySaved = withTimeoutOrNull(2_500L) {
-                takePictureSuspend(imageCapture, outputOptions, outFile)
+                takePictureSuspend(imageCapture, outputOptions, tempJpgFile, encOutFile)
             }
             if (primarySaved != null) {
                 return primarySaved
@@ -192,21 +207,23 @@ object IntruderPhotoCapturer {
             if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
                 delay(140L)
                 val secondSaved = withTimeoutOrNull(2_200L) {
-                    takePictureSuspend(imageCapture, outputOptions, outFile)
+                    takePictureSuspend(imageCapture, outputOptions, tempJpgFile, encOutFile)
                 }
                 if (secondSaved != null) {
                     return secondSaved
                 }
             }
 
-            // Fallback: encode latest live YUV frame from ImageAnalysis if still-capture pipeline failed.
+            // Fallback: encode latest live YUV frame from ImageAnalysis directly into encrypted storage.
             val frame = latestFrame.get()
             if (frame != null) {
                 val fallbackPath = withContext(Dispatchers.IO) {
-                    writeYuvFrameToJpeg(frame, outFile)
+                    writeYuvFrameToEncryptedFile(frame, encOutFile)
                 }
                 if (fallbackPath != null) {
-                    Log.i(TAG, "Saved session photo via ImageAnalysis fallback pipeline")
+                    if (BuildConfig.DEBUG) {
+                        Log.i(TAG, "Saved encrypted session photo via ImageAnalysis fallback pipeline")
+                    }
                     return fallbackPath
                 }
             }
@@ -214,6 +231,7 @@ object IntruderPhotoCapturer {
         } finally {
             latestFrame.set(null)
             imageAnalysis.clearAnalyzer()
+            runCatching { tempJpgFile.delete() }
             withContext(NonCancellable + Dispatchers.Main.immediate) {
                 runCatching { cameraProvider.unbindAll() }
             }
@@ -282,26 +300,44 @@ object IntruderPhotoCapturer {
     private suspend fun takePictureSuspend(
         imageCapture: ImageCapture,
         outputOptions: ImageCapture.OutputFileOptions,
-        outFile: File,
+        tempJpgFile: File,
+        encOutFile: File,
     ): String? = suspendCancellableCoroutine { cont: CancellableContinuation<String?> ->
         imageCapture.takePicture(
             outputOptions,
             ioExecutor,
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    if (cont.isActive) {
-                        val savedPath = if (outFile.exists() && outFile.length() > 0L) {
-                            outFile.absolutePath
+                    val encryptedPath = try {
+                        if (tempJpgFile.exists() && tempJpgFile.length() > 0L) {
+                            val rawBytes = tempJpgFile.readBytes()
+                            VaultFileCrypto.encryptBytes(rawBytes, encOutFile)
+                            rawBytes.fill(0)
+                            if (encOutFile.exists() && encOutFile.length() > 0L) {
+                                encOutFile.absolutePath
+                            } else {
+                                null
+                            }
                         } else {
                             null
                         }
-                        cont.resume(savedPath)
+                    } catch (_: Throwable) {
+                        runCatching { encOutFile.delete() }
+                        null
+                    } finally {
+                        runCatching { tempJpgFile.delete() }
+                    }
+                    if (cont.isActive) {
+                        cont.resume(encryptedPath)
                     }
                 }
 
                 override fun onError(exception: ImageCaptureException) {
-                    Log.w(TAG, "Automatic session photo capture failed: ${exception.message}")
-                    runCatching { outFile.delete() }
+                    if (BuildConfig.DEBUG) {
+                        Log.w(TAG, "Automatic session photo capture failed (code=${exception.imageCaptureError})")
+                    }
+                    runCatching { tempJpgFile.delete() }
+                    runCatching { encOutFile.delete() }
                     if (cont.isActive) {
                         cont.resume(null)
                     }
@@ -359,7 +395,7 @@ object IntruderPhotoCapturer {
         return nv21
     }
 
-    private fun writeYuvFrameToJpeg(frame: CapturedYuvFrame, outFile: File): String? {
+    private fun writeYuvFrameToEncryptedFile(frame: CapturedYuvFrame, encOutFile: File): String? {
         return runCatching {
             val yuvImage = YuvImage(frame.nv21, ImageFormat.NV21, frame.width, frame.height, null)
             val baos = ByteArrayOutputStream()
@@ -367,21 +403,21 @@ object IntruderPhotoCapturer {
                 return@runCatching null
             }
             val rawJpeg = baos.toByteArray()
-            if (frame.rotationDegrees != 0) {
+            val finalJpeg = if (frame.rotationDegrees != 0) {
                 val bitmap = BitmapFactory.decodeByteArray(rawJpeg, 0, rawJpeg.size) ?: return@runCatching null
                 val matrix = Matrix().apply { postRotate(frame.rotationDegrees.toFloat()) }
                 val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-                FileOutputStream(outFile).use { fos ->
-                    rotated.compress(Bitmap.CompressFormat.JPEG, 90, fos)
-                }
+                val rotatedBaos = ByteArrayOutputStream()
+                rotated.compress(Bitmap.CompressFormat.JPEG, 90, rotatedBaos)
                 if (rotated !== bitmap) rotated.recycle()
                 bitmap.recycle()
+                rotatedBaos.toByteArray()
             } else {
-                FileOutputStream(outFile).use { fos ->
-                    fos.write(rawJpeg)
-                }
+                rawJpeg
             }
-            if (outFile.exists() && outFile.length() > 0L) outFile.absolutePath else null
+            VaultFileCrypto.encryptBytes(finalJpeg, encOutFile)
+            finalJpeg.fill(0)
+            if (encOutFile.exists() && encOutFile.length() > 0L) encOutFile.absolutePath else null
         }.getOrNull()
     }
 }

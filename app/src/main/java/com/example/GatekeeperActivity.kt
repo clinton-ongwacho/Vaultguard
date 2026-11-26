@@ -320,7 +320,12 @@ class GatekeeperActivity : ComponentActivity() {
                 val isValid = repository.verifyAdminPassword(secret)
                 if (!isValid) {
                     failedAttempts += 1
-                    errorMessage = "Incorrect password."
+                    val lockoutSec = repository.getRemainingAuthLockoutSeconds()
+                    errorMessage = if (lockoutSec > 0) {
+                        "Too many failed attempts. Try again in ${lockoutSec}s."
+                    } else {
+                        "Incorrect password."
+                    }
                     val label = targetAppInfo?.appName ?: targetPackage.ifBlank { "System" }
                     val validPhoto = capturedPhotoPath?.takeIf { repository.hasValidPhotoFile(it) }
                     val failedId = repository.logEvent(

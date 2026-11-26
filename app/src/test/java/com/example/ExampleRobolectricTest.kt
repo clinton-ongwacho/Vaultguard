@@ -703,4 +703,142 @@ class ExampleRobolectricTest {
             controller.pause().stop().destroy()
         }
     }
+
+    @Test
+    fun `password hasher uses 120k v2 format and verifies legacy 10k hashes`() {
+        val v2Hash = PasswordHasher.hashPassword("S3cur3Pass!")
+        assertTrue(v2Hash.startsWith("v2\$120000\$"))
+        assertFalse(PasswordHasher.needsRehash(v2Hash))
+        assertTrue(PasswordHasher.verifyPassword("S3cur3Pass!", v2Hash))
+        assertFalse(PasswordHasher.verifyPassword("wrong", v2Hash))
+
+        // Construct a legacy 10,000-iteration salt:hash string and verify backwards compatibility
+        val salt = ByteArray(16) { it.toByte() }
+        val spec = javax.crypto.spec.PBEKeySpec("legacyPass".toCharArray(), salt, 10_000, 256)
+        val rawHash = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            .generateSecret(spec).encoded
+        val legacyStored = android.util.Base64.encodeToString(salt, android.util.Base64.NO_WRAP) + ":" +
+            android.util.Base64.encodeToString(rawHash, android.util.Base64.NO_WRAP)
+        assertTrue(PasswordHasher.needsRehash(legacyStored))
+        assertTrue(PasswordHasher.verifyPassword("legacyPass", legacyStored))
+        assertFalse(PasswordHasher.verifyPassword("notLegacyPass", legacyStored))
+    }
+
+    @Test
+    fun `secret cipher encrypts stealth config secrets and detects tampering`() {
+        val rawKeyBytes = ByteArray(32) { i -> (i * 11 + 5).toByte() }
+        val secretKey = javax.crypto.spec.SecretKeySpec(rawKeyBytes, "AES")
+
+        val encrypted = com.example.security.SecretCipher.encryptConfigSecretWithKey("shadow", secretKey)
+        assertTrue(encrypted.startsWith("vgc1:"))
+        assertFalse(encrypted.contains("shadow"))
+        assertEquals(
+            "shadow",
+            com.example.security.SecretCipher.decryptConfigSecretWithKey(encrypted, secretKey),
+        )
+
+        // Tampering with ciphertext must fail authentication and return empty string
+        val tampered = encrypted.dropLast(2) + "AA"
+        assertEquals(
+            "",
+            com.example.security.SecretCipher.decryptConfigSecretWithKey(tampered, secretKey),
+        )
+    }
+
+    @Test
+    fun `session photo decryption handles encrypted vgem bytes and blocks outside paths`() =
+        kotlinx.coroutines.runBlocking {
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val db = androidx.room.Room.inMemoryDatabaseBuilder(context, VaultDatabase::class.java)
+                .allowMainThreadQueries()
+                .build()
+            val photosDir = java.io.File(context.filesDir, "session_photos").apply { mkdirs() }
+            val vgemFile = java.io.File(photosDir, "test_enc_session.vgem")
+            val outsideFile = java.io.File(context.cacheDir, "outside_secret.txt")
+            val rawKeyBytes = ByteArray(32) { i -> (i * 3 + 9).toByte() }
+            val key = javax.crypto.spec.SecretKeySpec(rawKeyBytes, "AES")
+            val expectedBytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x11, 0x22, 0xFF.toByte(), 0xD9.toByte())
+            try {
+                com.example.security.VaultFileCrypto.encryptBytes(expectedBytes, vgemFile, key)
+                assertTrue(com.example.security.VaultFileCrypto.isEncryptedFile(vgemFile))
+                outsideFile.writeText("do_not_leak")
+
+                val repo = com.example.data.repository.VaultRepository(
+                    context = context,
+                    dao = db.vaultDao(),
+                    appsProvider = com.example.data.InstalledAppsProvider(context),
+                    launcherManager = com.example.launcher.LauncherDisguiseManager(context),
+                )
+                assertTrue(repo.hasValidPhotoFile(vgemFile.absolutePath))
+                val decrypted = com.example.security.VaultFileCrypto.decryptToBytes(vgemFile, key)
+                assertTrue(expectedBytes.contentEquals(decrypted))
+
+                // Outside-filesDir path traversal attempt must be rejected
+                val traversalPath = java.io.File(context.filesDir, "../cache/outside_secret.txt").absolutePath
+                assertFalse(repo.hasValidPhotoFile(traversalPath))
+                assertEquals(null, repo.decryptSessionPhotoBytes(traversalPath))
+            } finally {
+                vgemFile.delete()
+                outsideFile.delete()
+                db.close()
+            }
+        }
+
+    @Test
+    fun `repository enforces brute force cooldown after repeated failed password attempts`() =
+        kotlinx.coroutines.runBlocking {
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val db = androidx.room.Room.inMemoryDatabaseBuilder(context, VaultDatabase::class.java)
+                .allowMainThreadQueries()
+                .build()
+            try {
+                val repo = com.example.data.repository.VaultRepository(
+                    context = context,
+                    dao = db.vaultDao(),
+                    appsProvider = com.example.data.InstalledAppsProvider(context),
+                    launcherManager = com.example.launcher.LauncherDisguiseManager(context),
+                )
+                repo.initializeAdmin(
+                    password = "correct_password",
+                    wakeWord = "shadow",
+                    dialerPin = "742369",
+                )
+                assertEquals(0, repo.getRemainingAuthLockoutSeconds())
+
+                repeat(5) {
+                    assertFalse(repo.verifyAdminPassword("wrong_$it"))
+                }
+                assertTrue(repo.getRemainingAuthLockoutSeconds() > 0)
+                // Even the correct password is blocked while cooldown is active
+                assertFalse(repo.verifyAdminPassword("correct_password"))
+            } finally {
+                db.close()
+            }
+        }
+
+    @Test
+    fun `stealth search ignores blank query without launching main console`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        AppGuardRuntimeCache.updateConfig(
+            AdminConfigEntity(
+                isInitialized = true,
+                wakeWord = "shadow",
+                dialerPin = "742369",
+                guardActive = true,
+            )
+        )
+        val blankIntent = android.content.Intent(context, StealthSearchActivity::class.java).apply {
+            action = android.content.Intent.ACTION_SEARCH
+            putExtra(android.app.SearchManager.QUERY, "   ")
+        }
+        val controller = org.robolectric.Robolectric.buildActivity(StealthSearchActivity::class.java, blankIntent)
+            .create()
+        try {
+            val startedIntent = org.robolectric.Shadows.shadowOf(controller.get()).nextStartedActivity
+            assertEquals(null, startedIntent)
+            assertTrue(controller.get().isFinishing)
+        } finally {
+            controller.destroy()
+        }
+    }
 }

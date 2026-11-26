@@ -1,6 +1,7 @@
 package com.example.data.cloud
 
 import android.util.Log
+import com.example.BuildConfig
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.FirebaseFirestoreException
@@ -28,29 +29,28 @@ fun handleFirestoreError(
         ?: exception
 
     val currentUser = Firebase.auth.currentUser
-    val providerInfoList = currentUser?.providerData?.map { provider ->
-        JSONObject().apply {
-            put("providerId", provider.providerId)
-            put("email", provider.email)
-        }
-    } ?: emptyList()
+    val providerIds = currentUser?.providerData?.map { it.providerId }.orEmpty()
 
     val authInfoJson = JSONObject().apply {
-        put("userId", currentUser?.uid)
-        put("email", currentUser?.email)
-        put("emailVerified", currentUser?.isEmailVerified)
-        put("tenantId", currentUser?.tenantId)
-        put("providerInfo", JSONArray(providerInfoList))
+        put("authenticated", currentUser != null)
+        put("emailVerified", currentUser?.isEmailVerified == true)
+        put("providers", JSONArray(providerIds))
     }
 
+    val sanitizedPath = path?.replace(Regex("^users/[^/]+"), "users/[user]")
+    val errorSummary = (rootError as? FirebaseFirestoreException)?.code?.name
+        ?: rootError::class.java.simpleName
+
     val errorInfoJson = JSONObject().apply {
-        put("error", rootError.message ?: rootError.toString())
+        put("errorCode", errorSummary)
         put("operationType", operationType.value)
-        put("path", path)
+        put("path", sanitizedPath)
         put("authInfo", authInfoJson)
     }
 
     val jsonString = errorInfoJson.toString()
-    Log.e("FirestoreError", "Firestore Error: $jsonString")
+    if (BuildConfig.DEBUG) {
+        Log.e("FirestoreError", "Firestore Error: $jsonString")
+    }
     return jsonString
 }

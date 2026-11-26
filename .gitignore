@@ -14,6 +14,28 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Environment & Secrets
 .env
+.env.*
+!.env.example
+
+# Keystores, signing keys & certificates
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
 debug.keystore
+*-upload-key*
+
+# Build & Firebase local caches
+*.apk
+*.aab
+*.ap_
+.build-outputs/
+.firebase/
+captures/
+*.log
 *-debug.log

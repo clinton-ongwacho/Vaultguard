@@ -39,13 +39,16 @@ import com.example.restriction.SystemIntegrityStatus
 import com.example.restriction.SystemRestrictionStep
 import com.example.security.PasswordHasher
 import com.example.security.SecretCipher
+import com.example.security.VaultFileCrypto
 import com.example.service.AppGuardAccessibilityService
 import com.example.service.VaultDeviceAdminReceiver
 import com.example.service.VaultNotificationListenerService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 
 class VaultRepository(
     private val context: Context,
@@ -55,7 +58,35 @@ class VaultRepository(
     private val vaultMediaManager: VaultMediaManager = VaultMediaManager(context),
     private val deepRestrictionEngine: DeepRestrictionEngine = DeepRestrictionEngine(context, dao),
 ) {
-    val configFlow: Flow<AdminConfigEntity> = dao.observeConfig().map { it ?: AdminConfigEntity() }
+    private val authAttemptLock = Any()
+    private var consecutiveFailedAuthAttempts = 0
+    private var authLockoutUntilMillis = 0L
+
+    private fun encodeConfigForDb(config: AdminConfigEntity): AdminConfigEntity {
+        return config.copy(
+            wakeWord = SecretCipher.encryptConfigSecret(config.wakeWord),
+            dialerPin = SecretCipher.encryptConfigSecret(config.dialerPin),
+        )
+    }
+
+    private fun decodeConfigFromDb(config: AdminConfigEntity): AdminConfigEntity {
+        return config.copy(
+            wakeWord = SecretCipher.decryptConfigSecret(config.wakeWord),
+            dialerPin = SecretCipher.decryptConfigSecret(config.dialerPin),
+        )
+    }
+
+    private suspend fun getDecodedConfigOnce(): AdminConfigEntity? =
+        dao.getConfigOnce()?.let(::decodeConfigFromDb)
+
+    private suspend fun upsertEncodedConfig(config: AdminConfigEntity) {
+        dao.upsertConfig(encodeConfigForDb(config))
+        AppGuardRuntimeCache.updateConfig(config)
+    }
+
+    val configFlow: Flow<AdminConfigEntity> = dao.observeConfig().map {
+        decodeConfigFromDb(it ?: AdminConfigEntity())
+    }
     val limitedAppsFlow: Flow<List<LimitedAppEntity>> = dao.observeLimitedApps()
     val recentEventsFlow: Flow<List<AccessEventEntity>> = dao.observeRecentEvents()
     val appRestrictionFrequenciesFlow: Flow<List<AppRestrictionFrequency>> = dao.observeRestrictionEventFrequencies()
@@ -63,7 +94,19 @@ class VaultRepository(
     val securityQuestionsFlow: Flow<List<SecurityQuestionEntity>> = dao.observeSecurityQuestions()
 
     suspend fun syncRuntimeCache() {
-        val config = dao.getConfigOnce() ?: AdminConfigEntity().also { dao.upsertConfig(it) }
+        val raw = dao.getConfigOnce()
+        val config = if (raw == null) {
+            AdminConfigEntity().also { dao.upsertConfig(encodeConfigForDb(it)) }
+        } else {
+            val decoded = decodeConfigFromDb(raw)
+            val needsEncryptMigration = SecretCipher.isAndroidKeyStoreAvailable() &&
+                ((raw.wakeWord.isNotBlank() && !SecretCipher.isEncryptedConfigSecret(raw.wakeWord)) ||
+                    (raw.dialerPin.isNotBlank() && !SecretCipher.isEncryptedConfigSecret(raw.dialerPin)))
+            if (needsEncryptMigration) {
+                dao.upsertConfig(encodeConfigForDb(decoded))
+            }
+            decoded
+        }
         val rules = dao.getLimitedAppsOnce()
         deepRestrictionEngine.hydrateTrackedChannelsFromDb()
         AppGuardRuntimeCache.updateConfig(config)
@@ -93,8 +136,11 @@ class VaultRepository(
             notificationBlockEnabled = true,
             guardActive = true,
         )
-        dao.upsertConfig(config)
-        AppGuardRuntimeCache.updateConfig(config)
+        upsertEncodedConfig(config)
+        synchronized(authAttemptLock) {
+            consecutiveFailedAuthAttempts = 0
+            authLockoutUntilMillis = 0L
+        }
         if (securityQuestions.size >= 3) {
             saveSecurityQuestions(securityQuestions)
         }
@@ -150,10 +196,13 @@ class VaultRepository(
         newPassword: String,
     ): Boolean {
         if (!verifySecurityAnswersForReset(answersByQuestionId)) return false
-        val current = dao.getConfigOnce() ?: return false
+        val current = getDecodedConfigOnce() ?: return false
         val updated = current.copy(passwordHash = PasswordHasher.hashPassword(newPassword))
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
+        synchronized(authAttemptLock) {
+            consecutiveFailedAuthAttempts = 0
+            authLockoutUntilMillis = 0L
+        }
         logEvent(
             packageName = context.packageName,
             appName = "VaultGuard",
@@ -205,24 +254,56 @@ class VaultRepository(
         vaultMediaManager.clearUnlockedTempPreviews()
     }
 
+    fun getRemainingAuthLockoutSeconds(nowMillis: Long = System.currentTimeMillis()): Int {
+        synchronized(authAttemptLock) {
+            val remainingMs = authLockoutUntilMillis - nowMillis
+            return if (remainingMs > 0L) ((remainingMs + 999L) / 1000L).toInt() else 0
+        }
+    }
+
     suspend fun verifyAdminPassword(password: String): Boolean {
-        val config = dao.getConfigOnce() ?: return false
-        return PasswordHasher.verifyPassword(password, config.passwordHash)
+        val now = System.currentTimeMillis()
+        if (getRemainingAuthLockoutSeconds(now) > 0) {
+            return false
+        }
+        val config = getDecodedConfigOnce() ?: return false
+        val valid = PasswordHasher.verifyPassword(password, config.passwordHash)
+        if (valid) {
+            synchronized(authAttemptLock) {
+                consecutiveFailedAuthAttempts = 0
+                authLockoutUntilMillis = 0L
+            }
+            if (PasswordHasher.needsRehash(config.passwordHash)) {
+                upsertEncodedConfig(config.copy(passwordHash = PasswordHasher.hashPassword(password)))
+            }
+        } else {
+            synchronized(authAttemptLock) {
+                consecutiveFailedAuthAttempts += 1
+                val cooldownMs = when {
+                    consecutiveFailedAuthAttempts >= 10 -> 30_000L
+                    consecutiveFailedAuthAttempts >= 8 -> 15_000L
+                    consecutiveFailedAuthAttempts >= 5 -> 5_000L
+                    else -> 0L
+                }
+                if (cooldownMs > 0L) {
+                    authLockoutUntilMillis = now + cooldownMs
+                }
+            }
+        }
+        return valid
     }
 
     suspend fun updatePassword(newPassword: String) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(passwordHash = PasswordHasher.hashPassword(newPassword))
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         logEvent(context.packageName, "VaultGuard", "PASSWORD_CHANGED", "Admin password rotated")
     }
 
     suspend fun setGuardActive(active: Boolean) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(guardActive = active)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         logEvent(
             context.packageName,
             "VaultGuard",
@@ -232,17 +313,15 @@ class VaultRepository(
     }
 
     suspend fun setUninstallProtection(enabled: Boolean) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(uninstallProtectionEnabled = enabled)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
     }
 
     suspend fun setInstallGuard(enabled: Boolean) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(installGuardEnabled = enabled)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         logEvent(
             context.packageName,
             "VaultGuard",
@@ -252,28 +331,25 @@ class VaultRepository(
     }
 
     suspend fun setNotificationBlockEnabled(enabled: Boolean) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(notificationBlockEnabled = enabled)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
     }
 
     suspend fun setCapturePhotoOnOpenEnabled(enabled: Boolean) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(capturePhotoOnOpenEnabled = enabled)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
     }
 
     suspend fun updateStealthTriggers(wakeWord: String, dialerPin: String) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val cleanWake = wakeWord.trim().lowercase().ifBlank { current.wakeWord }
         val cleanPin = dialerPin.filter { it.isDigit() }.ifBlank {
             PasswordHasher.wakeWordToT9Digits(cleanWake).ifBlank { "82858" }
         }
         val updated = current.copy(wakeWord = cleanWake, dialerPin = cleanPin)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         logEvent(
             context.packageName,
             "VaultGuard",
@@ -287,13 +363,12 @@ class VaultRepository(
         hideFromLauncher: Boolean,
     ) {
         launcherManager.applyLauncherState(disguise, hideFromLauncher)
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(
             disguiseName = disguise.name,
             isAppHidden = hideFromLauncher,
         )
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         logEvent(
             context.packageName,
             disguise.displayLabel,
@@ -307,10 +382,9 @@ class VaultRepository(
     }
 
     suspend fun setRedirectDisplayStyle(style: RedirectDisplayStyle) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(redirectDisplayName = style.name)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         logEvent(
             context.packageName,
             "VaultGuard",
@@ -320,10 +394,9 @@ class VaultRepository(
     }
 
     suspend fun setRedirectDecoyMode(mode: RedirectDecoyMode) {
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(redirectDecoyMode = mode.name)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         val label = if (mode == RedirectDecoyMode.FAKE_CRASH) "Fake Crash" else "Icon Display"
         logEvent(
             context.packageName,
@@ -338,10 +411,9 @@ class VaultRepository(
             5, 15, 60 -> seconds
             else -> 0
         }
-        val current = dao.getConfigOnce() ?: AdminConfigEntity()
+        val current = getDecodedConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(immediateLockTimeoutSeconds = clamped)
-        dao.upsertConfig(updated)
-        AppGuardRuntimeCache.updateConfig(updated)
+        upsertEncodedConfig(updated)
         val label = when (clamped) {
             0 -> "Immediate"
             60 -> "1 minute"
@@ -585,10 +657,29 @@ class VaultRepository(
         }
     }
 
+    private fun resolveConfinedFilesDirFile(photoPath: String?): File? {
+        if (photoPath.isNullOrBlank()) return null
+        return runCatching {
+            val filesRoot = context.filesDir.canonicalPath + File.separator
+            val candidate = File(photoPath)
+            val canon = candidate.canonicalPath
+            if (canon.startsWith(filesRoot)) candidate else null
+        }.getOrNull()
+    }
+
     fun hasValidPhotoFile(photoPath: String?): Boolean {
-        if (photoPath.isNullOrBlank()) return false
-        val file = File(photoPath)
+        val file = resolveConfinedFilesDirFile(photoPath) ?: return false
         return file.exists() && file.length() > 0L
+    }
+
+    suspend fun decryptSessionPhotoBytes(photoPath: String?): ByteArray? = withContext(Dispatchers.IO) {
+        val file = resolveConfinedFilesDirFile(photoPath) ?: return@withContext null
+        if (!file.exists() || file.length() <= 0L) return@withContext null
+        if (VaultFileCrypto.isEncryptedFile(file)) {
+            runCatching { VaultFileCrypto.decryptToBytes(file) }.getOrNull()
+        } else {
+            runCatching { file.readBytes() }.getOrNull()
+        }
     }
 
     suspend fun logEvent(
