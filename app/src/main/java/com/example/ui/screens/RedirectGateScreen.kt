@@ -106,6 +106,7 @@ fun RedirectGateScreen(
     redirectDecoyMode: RedirectDecoyMode = RedirectDecoyMode.ICON_DISPLAY,
     errorMessage: String?,
     failedAttempts: Int,
+    isBusy: Boolean = false,
     onGoHome: () -> Unit,
     onVerifyAndProceed: (password: String) -> Unit,
     onClearError: () -> Unit,
@@ -200,7 +201,7 @@ fun RedirectGateScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .minimumInteractiveComponentSize()
-                                .clickable(onClick = onGoHome)
+                                .clickable(enabled = !isBusy, onClick = onGoHome)
                                 .padding(horizontal = 22.dp, vertical = 14.dp)
                                 .testTag("fake_crash_close_app_button"),
                             verticalAlignment = Alignment.CenterVertically,
@@ -408,6 +409,7 @@ fun RedirectGateScreen(
                     ) {
                         OutlinedButton(
                             onClick = onGoHome,
+                            enabled = !isBusy,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(50.dp)
@@ -419,6 +421,7 @@ fun RedirectGateScreen(
 
                         Button(
                             onClick = { onVerifyAndProceed(password) },
+                            enabled = !isBusy,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = MaterialTheme.colorScheme.primary,
                                 contentColor = MaterialTheme.colorScheme.onPrimary,
@@ -430,7 +433,11 @@ fun RedirectGateScreen(
                             shape = RoundedCornerShape(14.dp),
                         ) {
                             Text(
-                                if (mode == GatekeeperActivity.MODE_REDIRECT_APP) "Open" else "Unlock"
+                                when {
+                                    isBusy -> "Checking..."
+                                    mode == GatekeeperActivity.MODE_REDIRECT_APP -> "Open"
+                                    else -> "Unlock"
+                                }
                             )
                         }
                     }

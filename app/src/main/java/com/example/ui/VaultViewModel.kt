@@ -1,6 +1,8 @@
 package com.example.ui
 
+import android.content.Intent
 import android.content.IntentSender
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -9,6 +11,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.AppGuardRuntimeCache
 import com.example.data.InstalledAppInfo
 import com.example.data.cloud.CloudSyncRepository
+import com.example.data.db.AppRestrictionFrequency
 import com.example.data.entity.AccessEventEntity
 import com.example.data.entity.AdminConfigEntity
 import com.example.data.entity.AppGuardMode
@@ -22,12 +25,20 @@ import com.example.data.entity.VaultMediaEntity
 import com.example.data.repository.VaultRepository
 import com.example.ota.OtaUiState
 import com.example.ota.OtaUpdateManager
+import com.example.restriction.EnforcementVerificationState
+import com.example.restriction.PackageInspectionReport
+import com.example.restriction.SystemIntegrityStatus
+import com.example.restriction.SystemRestrictionStep
+import com.example.restriction.UniversalChannelTracker
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -36,6 +47,9 @@ import kotlinx.coroutines.launch
 data class AppRuleRow(
     val appInfo: InstalledAppInfo,
     val rule: LimitedAppEntity?,
+    val inspectionReport: PackageInspectionReport? = null,
+    val restrictionFrequency: Int = 0,
+    val lastRestrictedAtMillis: Long = 0L,
 ) {
     val isLimited: Boolean get() = rule?.isLimited == true
     val guardMode: AppGuardMode get() = rule?.guardModeEnum ?: AppGuardMode.NONE
@@ -63,20 +77,28 @@ data class VaultUiState(
     val securityQuestions: List<SecurityQuestionEntity> = emptyList(),
     val statusBannerMessage: String? = null,
     val apps: List<AppRuleRow> = emptyList(),
+    val inspectionReports: Map<String, PackageInspectionReport> = emptyMap(),
     val isLoadingApps: Boolean = true,
     val appSearchQuery: String = "",
     val showLimitedOnly: Boolean = false,
     val showSystemApps: Boolean = false,
     val recentEvents: List<AccessEventEntity> = emptyList(),
+    val systemIntegrity: SystemIntegrityStatus = SystemIntegrityStatus(),
     val isAccessibilityEnabled: Boolean = false,
     val isDeviceAdminEnabled: Boolean = false,
     val isNotificationListenerEnabled: Boolean = false,
-    val isNotificationPolicyAccessGranted: Boolean = false,
     val isCameraPermissionGranted: Boolean = false,
     val isPostNotificationsGranted: Boolean = true,
+    val pendingEndRestrictionPackage: String? = null,
+    val suggestedFrequentApps: List<AppRuleRow> = emptyList(),
+    val hasFrequentRestrictionHistory: Boolean = false,
     val otaState: OtaUiState = OtaUiState(),
 ) {
     val limitedCount: Int get() = apps.count { it.isLimited }
+    val pendingSystemGapCount: Int
+        get() = apps.count {
+            it.isLimited && it.inspectionReport?.verificationState == EnforcementVerificationState.ACTIVE_WITH_SYSTEM_GAPS
+        }
     val activeDisguise: DisguiseIdentity get() = DisguiseIdentity.fromName(config.disguiseName)
     val activeRedirectDisplay: RedirectDisplayStyle get() = RedirectDisplayStyle.fromName(config.redirectDisplayName)
     val activeRedirectDecoyMode: RedirectDecoyMode get() = RedirectDecoyMode.fromName(config.redirectDecoyMode)
@@ -105,17 +127,21 @@ private data class LocalControlState(
     val statusBannerMessage: String? = null,
     val cloudSyncError: String? = null,
     val installedApps: List<InstalledAppInfo> = emptyList(),
+    val inspectionReports: Map<String, PackageInspectionReport> = emptyMap(),
     val pinnedTopPackages: Set<String>? = null,
     val isLoadingApps: Boolean = true,
     val appSearchQuery: String = "",
     val showLimitedOnly: Boolean = false,
     val showSystemApps: Boolean = false,
     val isAccessibilityEnabled: Boolean = false,
+    val isAccessibilityBound: Boolean = false,
     val isDeviceAdminEnabled: Boolean = false,
     val isNotificationListenerEnabled: Boolean = false,
-    val isNotificationPolicyAccessGranted: Boolean = false,
+    val isNotificationListenerBound: Boolean = false,
     val isCameraPermissionGranted: Boolean = false,
     val isPostNotificationsGranted: Boolean = true,
+    val isDeviceOwnerActive: Boolean = false,
+    val pendingEndRestrictionPackage: String? = null,
 )
 
 private data class CoreDbSnapshot(
@@ -124,6 +150,7 @@ private data class CoreDbSnapshot(
     val events: List<AccessEventEntity>,
     val vaultMedia: List<VaultMediaEntity>,
     val securityQuestions: List<SecurityQuestionEntity>,
+    val frequencies: List<AppRestrictionFrequency>,
 )
 
 class VaultViewModel(
@@ -141,18 +168,24 @@ class VaultViewModel(
     private var latestLimitedPackages: Set<String> = emptySet()
 
     private val dbSnapshotFlow = combine(
-        repository.configFlow,
-        repository.limitedAppsFlow,
-        repository.recentEventsFlow,
-        repository.vaultMediaFlow,
-        repository.securityQuestionsFlow,
-    ) { config, limitedRules, events, vaultMedia, securityQuestions ->
+        combine(
+            repository.configFlow,
+            repository.limitedAppsFlow,
+            repository.recentEventsFlow,
+        ) { config, limitedRules, events -> Triple(config, limitedRules, events) },
+        combine(
+            repository.vaultMediaFlow,
+            repository.securityQuestionsFlow,
+            repository.appRestrictionFrequenciesFlow,
+        ) { vaultMedia, securityQuestions, frequencies -> Triple(vaultMedia, securityQuestions, frequencies) },
+    ) { (config, limitedRules, events), (vaultMedia, securityQuestions, frequencies) ->
         CoreDbSnapshot(
             config = config,
             limitedRules = limitedRules,
             events = events,
             vaultMedia = vaultMedia,
             securityQuestions = securityQuestions,
+            frequencies = frequencies,
         )
     }
 
@@ -161,11 +194,28 @@ class VaultViewModel(
         localState,
         otaUpdateManager.state,
     ) { snapshot, local, ota ->
-        latestLimitedPackages = snapshot.limitedRules.filter { it.isLimited }.map { it.packageName }.toSet()
-        val rulesMap = snapshot.limitedRules.associateBy { it.packageName }
+        val limitedRules = snapshot.limitedRules
+        latestLimitedPackages = limitedRules.filter { it.isLimited }.map { it.packageName }.toSet()
+        val rulesMap = limitedRules.associateBy { it.packageName }
+        val freqMap = snapshot.frequencies.associateBy { it.packageName }
         val pinned = local.pinnedTopPackages
         val rows = local.installedApps.map { info ->
-            AppRuleRow(appInfo = info, rule = rulesMap[info.packageName])
+            val rule = rulesMap[info.packageName]
+            val freqStat = freqMap[info.packageName]
+            val combinedFreq = (freqStat?.eventCount ?: 0) +
+                (rule?.blockCount ?: 0) +
+                (if (rule?.isLimited == true) 1 else 0)
+            val lastRestrictedAt = maxOf(
+                freqStat?.lastEventAtMillis ?: 0L,
+                rule?.lastBlockedAtMillis ?: 0L,
+            )
+            AppRuleRow(
+                appInfo = info,
+                rule = rule,
+                inspectionReport = local.inspectionReports[info.packageName],
+                restrictionFrequency = combinedFreq,
+                lastRestrictedAtMillis = lastRestrictedAt,
+            )
         }.sortedWith(
             compareByDescending<AppRuleRow> { row ->
                 if (pinned != null) {
@@ -177,6 +227,44 @@ class VaultViewModel(
                 .thenBy { it.appInfo.isSystemApp }
                 .thenBy { it.appInfo.appName.lowercase() }
         )
+
+        val frequentCandidates = rows.filter { it.restrictionFrequency > 0 }
+        val hasFrequentHistory = frequentCandidates.isNotEmpty()
+        val suggestedFrequent = if (hasFrequentHistory) {
+            frequentCandidates.sortedWith(
+                compareByDescending<AppRuleRow> { it.restrictionFrequency }
+                    .thenBy { it.isLimited }
+                    .thenByDescending { it.lastRestrictedAtMillis }
+                    .thenBy { it.appInfo.appName.lowercase() }
+            ).take(8)
+        } else {
+            rows.filter { !it.appInfo.isSystemApp }
+                .sortedWith(
+                    compareByDescending<AppRuleRow> { categoryPriority(it.appInfo.category) }
+                        .thenBy { it.appInfo.appName.lowercase() }
+                )
+                .take(6)
+        }
+
+        val requiresMaskedNotifications = limitedRules.any {
+            it.isLimited && it.notificationPrivacyEnum == NotificationPrivacyMode.SHOW_HIDE_SENSITIVE
+        }
+        val integrity = SystemIntegrityStatus(
+            isAccessibilityEnabled = local.isAccessibilityEnabled,
+            isAccessibilityServiceBound = local.isAccessibilityBound,
+            isNotificationListenerEnabled = local.isNotificationListenerEnabled,
+            isNotificationListenerBound = local.isNotificationListenerBound,
+            isDeviceAdminEnabled = local.isDeviceAdminEnabled,
+            isCameraPermissionGranted = local.isCameraPermissionGranted,
+            isPostNotificationsGranted = local.isPostNotificationsGranted,
+            isDeviceOwnerActive = local.isDeviceOwnerActive,
+            guardActive = snapshot.config.guardActive,
+            notificationBlockEnabled = snapshot.config.notificationBlockEnabled,
+            uninstallProtectionEnabled = snapshot.config.uninstallProtectionEnabled,
+            capturePhotoOnOpenEnabled = snapshot.config.capturePhotoOnOpenEnabled,
+            requiresPostNotificationsForMaskedAlerts = requiresMaskedNotifications,
+        )
+
         VaultUiState(
             currentUserId = currentUserId,
             userDisplayName = userDisplayName,
@@ -197,17 +285,21 @@ class VaultViewModel(
             securityQuestions = snapshot.securityQuestions,
             statusBannerMessage = local.statusBannerMessage,
             apps = rows,
+            inspectionReports = local.inspectionReports,
             isLoadingApps = local.isLoadingApps,
             appSearchQuery = local.appSearchQuery,
             showLimitedOnly = local.showLimitedOnly,
             showSystemApps = local.showSystemApps,
             recentEvents = snapshot.events,
+            systemIntegrity = integrity,
             isAccessibilityEnabled = local.isAccessibilityEnabled,
             isDeviceAdminEnabled = local.isDeviceAdminEnabled,
             isNotificationListenerEnabled = local.isNotificationListenerEnabled,
-            isNotificationPolicyAccessGranted = local.isNotificationPolicyAccessGranted,
             isCameraPermissionGranted = local.isCameraPermissionGranted,
             isPostNotificationsGranted = local.isPostNotificationsGranted,
+            pendingEndRestrictionPackage = local.pendingEndRestrictionPackage,
+            suggestedFrequentApps = suggestedFrequent,
+            hasFrequentRestrictionHistory = hasFrequentHistory,
             otaState = ota,
         )
     }.stateIn(
@@ -230,11 +322,87 @@ class VaultViewModel(
     init {
         refreshSystemStatus()
         refreshInstalledApps()
+        observeRuntimeTelemetry()
+        observeSystemPermissionSettings()
+        observeForegroundPermissionChanges()
         if (currentUserId.isNotBlank()) {
             syncSignedInAccount()
             observeCloudRules()
             observeAppReleases()
             otaUpdateManager.checkForUpdates()
+        }
+    }
+
+    private fun categoryPriority(category: Int): Int {
+        return when (category) {
+            ApplicationInfo.CATEGORY_SOCIAL -> 5
+            ApplicationInfo.CATEGORY_VIDEO -> 4
+            ApplicationInfo.CATEGORY_GAME -> 3
+            ApplicationInfo.CATEGORY_AUDIO -> 2
+            ApplicationInfo.CATEGORY_NEWS -> 1
+            else -> 0
+        }
+    }
+
+    private fun observeRuntimeTelemetry() {
+        viewModelScope.launch {
+            combine(
+                AppGuardRuntimeCache.accessibilityConnected,
+                AppGuardRuntimeCache.notificationListenerConnected,
+                UniversalChannelTracker.channelVersion,
+                AppGuardRuntimeCache.restrictionStateVersion,
+            ) { a11y, nls, chVer, rsVer ->
+                "$a11y:$nls:$chVer:$rsVer"
+            }.collectLatest {
+                refreshSystemStatus()
+            }
+        }
+    }
+
+    private fun observeSystemPermissionSettings() {
+        viewModelScope.launch {
+            repository.observeSystemPermissionSettings().collectLatest {
+                refreshSystemStatus()
+            }
+        }
+    }
+
+    private fun observeForegroundPermissionChanges() {
+        viewModelScope.launch {
+            AppGuardRuntimeCache.foregroundActive.collectLatest { active ->
+                if (!active) return@collectLatest
+                while (true) {
+                    delay(1_200L)
+                    val cur = localState.value
+                    val coreChanged =
+                        repository.isAccessibilityServiceEnabled() != cur.isAccessibilityEnabled ||
+                            repository.isDeviceAdminActive() != cur.isDeviceAdminEnabled ||
+                            repository.isNotificationListenerEnabled() != cur.isNotificationListenerEnabled ||
+                            repository.isCameraPermissionGranted() != cur.isCameraPermissionGranted ||
+                            repository.isPostNotificationsGranted() != cur.isPostNotificationsGranted ||
+                            repository.isDeviceOwnerActive() != cur.isDeviceOwnerActive
+                    if (coreChanged) {
+                        refreshSystemStatus()
+                    } else {
+                        val inspected = activeInspectedConfig
+                        val targetPkg = inspected?.first ?: cur.pendingEndRestrictionPackage
+                        if (targetPkg != null) {
+                            val matched = cur.installedApps.firstOrNull { it.packageName == targetPkg }
+                            if (matched != null) {
+                                val liveReport = repository.inspectSingleAppRestriction(
+                                    packageName = matched.packageName,
+                                    appName = matched.appName,
+                                    isRestricted = inspected?.second ?: false,
+                                    silentAndHide = inspected?.third ?: true,
+                                )
+                                if (liveReport != cur.inspectionReports[targetPkg]) {
+                                    reverifyRestrictedApps()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -290,30 +458,158 @@ class VaultViewModel(
         localState.update {
             it.copy(
                 isAccessibilityEnabled = repository.isAccessibilityServiceEnabled(),
+                isAccessibilityBound = AppGuardRuntimeCache.accessibilityConnected.value,
                 isDeviceAdminEnabled = repository.isDeviceAdminActive(),
                 isNotificationListenerEnabled = repository.isNotificationListenerEnabled(),
-                isNotificationPolicyAccessGranted = repository.isNotificationPolicyAccessGranted(),
+                isNotificationListenerBound = AppGuardRuntimeCache.notificationListenerConnected.value,
                 isCameraPermissionGranted = repository.isCameraPermissionGranted(),
                 isPostNotificationsGranted = repository.isPostNotificationsGranted(),
+                isDeviceOwnerActive = repository.isDeviceOwnerActive(),
             )
         }
+        reverifyRestrictedApps()
+    }
+
+    @Volatile
+    private var activeInspectedConfig: Triple<String, Boolean, Boolean>? = null
+
+    private var reverifyJob: Job? = null
+
+    fun reverifyRestrictedApps() {
+        val currentApps = localState.value.installedApps
+        if (currentApps.isEmpty()) return
+        val initialOverride = activeInspectedConfig
+        val pendingEndPkg = localState.value.pendingEndRestrictionPackage
+        reverifyJob?.cancel()
+        reverifyJob = viewModelScope.launch {
+            if (initialOverride != null) {
+                val (pkg, isRestrictedPreview, silentAndHide) = initialOverride
+                val matched = currentApps.firstOrNull { it.packageName == pkg }
+                if (matched != null) {
+                    val quickReport = repository.inspectSingleAppRestriction(
+                        packageName = matched.packageName,
+                        appName = matched.appName,
+                        isRestricted = isRestrictedPreview,
+                        silentAndHide = silentAndHide,
+                    )
+                    localState.update { current ->
+                        current.copy(inspectionReports = current.inspectionReports + (pkg to quickReport))
+                    }
+                }
+            }
+            val reports = repository.inspectAllAppRestrictions(currentApps).toMutableMap()
+            val latestOverride = activeInspectedConfig ?: initialOverride
+            if (latestOverride != null) {
+                val (pkg, isRestrictedPreview, silentAndHide) = latestOverride
+                val matched = currentApps.firstOrNull { it.packageName == pkg }
+                if (matched != null) {
+                    reports[pkg] = repository.inspectSingleAppRestriction(
+                        packageName = matched.packageName,
+                        appName = matched.appName,
+                        isRestricted = isRestrictedPreview,
+                        silentAndHide = silentAndHide,
+                    )
+                }
+            }
+            if (pendingEndPkg != null) {
+                val pendingReport = reports[pendingEndPkg]
+                val matchedApp = currentApps.firstOrNull { it.packageName == pendingEndPkg }
+                if (pendingReport != null && pendingReport.restoreSteps.isEmpty() && matchedApp != null) {
+                    val finalizeResult = repository.setAppGuardRule(
+                        packageName = matchedApp.packageName,
+                        appName = matchedApp.appName,
+                        guardMode = AppGuardMode.NONE,
+                    )
+                    finalizeResult.onSuccess { finalizedReport ->
+                        reports[pendingEndPkg] = finalizedReport
+                        if (!finalizedReport.isRestricted) {
+                            activeInspectedConfig = null
+                            AppGuardRuntimeCache.activeSetupPackage = null
+                            localState.update {
+                                it.copy(
+                                    pendingEndRestrictionPackage = null,
+                                    statusBannerMessage = "All settings restored. ${matchedApp.appName} restriction ended.",
+                                )
+                            }
+                            if (currentUserId.isNotBlank()) {
+                                cloudSyncRepository.syncLimitedApp(
+                                    packageName = matchedApp.packageName,
+                                    appName = matchedApp.appName,
+                                    limited = false,
+                                    blockCount = 0,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            localState.update { it.copy(inspectionReports = reports) }
+        }
+    }
+
+    fun clearPendingEndRestriction() {
+        AppGuardRuntimeCache.activeSetupPackage = null
+        localState.update { it.copy(pendingEndRestrictionPackage = null) }
+    }
+
+    fun inspectAppForConfig(
+        row: AppRuleRow,
+        isRestrictedPreview: Boolean,
+        silentAndHide: Boolean,
+    ) {
+        val pkg = row.appInfo.packageName
+        AppGuardRuntimeCache.activeSetupPackage = pkg
+        activeInspectedConfig = Triple(pkg, isRestrictedPreview, silentAndHide)
+        viewModelScope.launch {
+            val report = repository.inspectSingleAppRestriction(
+                packageName = pkg,
+                appName = row.appInfo.appName,
+                isRestricted = isRestrictedPreview,
+                silentAndHide = silentAndHide,
+            )
+            localState.update { current ->
+                current.copy(inspectionReports = current.inspectionReports + (pkg to report))
+            }
+        }
+    }
+
+    fun clearInspectedAppForConfig() {
+        activeInspectedConfig = null
+        AppGuardRuntimeCache.activeSetupPackage = null
+        reverifyRestrictedApps()
     }
 
     fun onAppsScreenOpened() {
         localState.update { it.copy(pinnedTopPackages = latestLimitedPackages) }
+        refreshSystemStatus()
     }
 
     fun refreshInstalledApps() {
         viewModelScope.launch {
             localState.update { it.copy(isLoadingApps = true) }
             val apps = repository.loadInstalledApps()
+            val reports = repository.inspectAllAppRestrictions(apps)
             localState.update {
                 it.copy(
                     installedApps = apps,
+                    inspectionReports = reports,
                     pinnedTopPackages = latestLimitedPackages,
                     isLoadingApps = false,
                 )
             }
+        }
+    }
+
+    fun buildSystemSettingsIntent(step: SystemRestrictionStep): Intent =
+        repository.buildSystemSettingsIntent(step)
+
+    fun buildSystemSettingsIntentChain(step: SystemRestrictionStep): List<Intent> =
+        repository.buildSystemSettingsIntentChain(step)
+
+    fun onGuidedSystemStepOpened(packageName: String, step: SystemRestrictionStep) {
+        viewModelScope.launch {
+            repository.recordGuidedSystemStepOpened(packageName, step)
+            reverifyRestrictedApps()
         }
     }
 
@@ -356,6 +652,7 @@ class VaultViewModel(
                     statusBannerMessage = "Admin vault initialized with backup reset questions.",
                 )
             }
+            refreshSystemStatus()
         }
     }
 
@@ -371,6 +668,7 @@ class VaultViewModel(
                         stealthWakeActive = false,
                     )
                 }
+                refreshSystemStatus()
             } else {
                 localState.update {
                     it.copy(
@@ -386,6 +684,17 @@ class VaultViewModel(
                 )
             }
         }
+    }
+
+    fun restoreSessionUnlockedFromAliasHandoff() {
+        localState.update {
+            it.copy(
+                isSessionUnlocked = true,
+                authError = null,
+                failedUnlockAttempts = 0,
+            )
+        }
+        refreshSystemStatus()
     }
 
     fun lockSession() {
@@ -408,6 +717,10 @@ class VaultViewModel(
 
     fun clearStatusBanner() {
         localState.update { it.copy(statusBannerMessage = null) }
+    }
+
+    fun showStatusBanner(message: String) {
+        localState.update { it.copy(statusBannerMessage = message) }
     }
 
     fun unlockVaultMedia(password: String) {
@@ -573,6 +886,7 @@ class VaultViewModel(
                         statusBannerMessage = "Admin password reset successfully.",
                     )
                 }
+                refreshSystemStatus()
                 onResult(true, "Admin password reset successfully.")
             } else {
                 onResult(false, "At least 2 matching answers (out of 3+ saved questions) are required.")
@@ -597,6 +911,10 @@ class VaultViewModel(
         guardMode: AppGuardMode,
         privacyMode: NotificationPrivacyMode = NotificationPrivacyMode.SILENT_AND_HIDE,
     ) {
+        activeInspectedConfig = null
+        if (guardMode != AppGuardMode.NONE) {
+            AppGuardRuntimeCache.activeSetupPackage = null
+        }
         viewModelScope.launch {
             val result = repository.setAppGuardRule(
                 packageName = row.appInfo.packageName,
@@ -605,14 +923,64 @@ class VaultViewModel(
                 privacyMode = privacyMode,
             )
             result.fold(
-                onSuccess = {
-                    if (currentUserId.isNotBlank()) {
+                onSuccess = { report ->
+                    val restrictBlockedByPermissions = guardMode != AppGuardMode.NONE &&
+                        !report.canApplyRestriction
+                    val endedBlockedByRestore = guardMode == AppGuardMode.NONE &&
+                        report.isRestricted &&
+                        report.restoreSteps.isNotEmpty()
+                    if (restrictBlockedByPermissions) {
+                        AppGuardRuntimeCache.activeSetupPackage = row.appInfo.packageName
+                        val msg = if (report.missingCorePermissions.isNotEmpty()) {
+                            "Enable ${report.missingCorePermissions.joinToString(" & ")} before restricting ${row.appInfo.appName}."
+                        } else {
+                            "Complete ${report.pendingSystemSteps.size} permission approval(s) before restricting ${row.appInfo.appName}."
+                        }
+                        localState.update {
+                            it.copy(statusBannerMessage = msg)
+                        }
+                    } else if (endedBlockedByRestore) {
+                        AppGuardRuntimeCache.activeSetupPackage = row.appInfo.packageName
+                        localState.update {
+                            it.copy(
+                                pendingEndRestrictionPackage = row.appInfo.packageName,
+                                statusBannerMessage = "Restore ${report.restoreSteps.size} setting(s) for ${row.appInfo.appName} before ending restriction.",
+                            )
+                        }
+                    } else if (guardMode == AppGuardMode.NONE && !report.isRestricted) {
+                        AppGuardRuntimeCache.activeSetupPackage = null
+                        localState.update { current ->
+                            current.copy(
+                                pendingEndRestrictionPackage = if (current.pendingEndRestrictionPackage == row.appInfo.packageName) {
+                                    null
+                                } else {
+                                    current.pendingEndRestrictionPackage
+                                },
+                                statusBannerMessage = "${row.appInfo.appName} restriction ended.",
+                            )
+                        }
+                    }
+
+                    refreshSystemStatus()
+                    if (currentUserId.isNotBlank() && !endedBlockedByRestore && !restrictBlockedByPermissions) {
                         cloudSyncRepository.syncLimitedApp(
                             packageName = row.appInfo.packageName,
                             appName = row.appInfo.appName,
                             limited = guardMode != AppGuardMode.NONE,
                             blockCount = row.rule?.blockCount ?: 0,
                         )
+                    }
+                    if (!endedBlockedByRestore && !restrictBlockedByPermissions && guardMode != AppGuardMode.NONE) {
+                        val banner = when (report.verificationState) {
+                            EnforcementVerificationState.DEGRADED_PERMISSION_MISSING ->
+                                "Enable ${report.missingCorePermissions.joinToString(" & ")} to enforce ${row.appInfo.appName}."
+                            EnforcementVerificationState.ACTIVE_WITH_SYSTEM_GAPS ->
+                                "${row.appInfo.appName}: ${report.pendingSystemSteps.size} system toggle(s) need approval."
+                            else -> null
+                        }
+                        if (banner != null) {
+                            localState.update { it.copy(statusBannerMessage = banner) }
+                        }
                     }
                 },
                 onFailure = { err ->
@@ -632,12 +1000,14 @@ class VaultViewModel(
     fun setGuardActive(active: Boolean) {
         viewModelScope.launch {
             repository.setGuardActive(active)
+            refreshSystemStatus()
         }
     }
 
     fun setUninstallProtection(enabled: Boolean) {
         viewModelScope.launch {
             repository.setUninstallProtection(enabled)
+            refreshSystemStatus()
         }
     }
 
@@ -650,12 +1020,14 @@ class VaultViewModel(
     fun setNotificationBlockEnabled(enabled: Boolean) {
         viewModelScope.launch {
             repository.setNotificationBlockEnabled(enabled)
+            refreshSystemStatus()
         }
     }
 
     fun setCapturePhotoOnOpenEnabled(enabled: Boolean) {
         viewModelScope.launch {
             repository.setCapturePhotoOnOpenEnabled(enabled)
+            refreshSystemStatus()
         }
     }
 
@@ -665,9 +1037,9 @@ class VaultViewModel(
             localState.update {
                 it.copy(
                     statusBannerMessage = if (hideFromLauncher) {
-                        "App icon hidden from launcher. Search your wake word or dial your code to reopen."
+                        "App icon hidden from launcher."
                     } else {
-                        "Launcher disguised as ${disguise.displayLabel}. Launcher icons may take 1-2s to refresh."
+                        "Launcher disguised as ${disguise.displayLabel}."
                     }
                 )
             }
@@ -678,7 +1050,7 @@ class VaultViewModel(
         viewModelScope.launch {
             repository.setRedirectDisplayStyle(style)
             localState.update {
-                it.copy(statusBannerMessage = "Redirect icon display set to \"${style.displayLabel}\".")
+                it.copy(statusBannerMessage = "Icon display: ${style.displayLabel}.")
             }
         }
     }
@@ -689,9 +1061,9 @@ class VaultViewModel(
             localState.update {
                 it.copy(
                     statusBannerMessage = if (mode == RedirectDecoyMode.FAKE_CRASH) {
-                        "Fake Crash enabled (Icon Display turned off)."
+                        "Fake Crash enabled."
                     } else {
-                        "Icon Display enabled (Fake Crash turned off)."
+                        "Icon Display enabled."
                     }
                 )
             }
@@ -707,7 +1079,7 @@ class VaultViewModel(
                 else -> "$seconds seconds"
             }
             localState.update {
-                it.copy(statusBannerMessage = "Lock timing after app switch set to $label.")
+                it.copy(statusBannerMessage = "Re-lock delay: $label.")
             }
         }
     }
@@ -756,7 +1128,7 @@ class VaultViewModel(
         viewModelScope.launch {
             repository.updateStealthTriggers(wakeWord, dialerPin)
             localState.update {
-                it.copy(statusBannerMessage = "Stealth wake word and dialer code updated.")
+                it.copy(statusBannerMessage = "Stealth triggers updated.")
             }
         }
     }
@@ -776,7 +1148,7 @@ class VaultViewModel(
                 return@launch
             }
             repository.updatePassword(newPassword)
-            onResult(true, "Admin password updated successfully.")
+            onResult(true, "Admin password updated.")
         }
     }
 

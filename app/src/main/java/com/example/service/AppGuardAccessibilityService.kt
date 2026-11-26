@@ -2,6 +2,7 @@ package com.example.service
 
 import android.accessibilityservice.AccessibilityService
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -13,7 +14,9 @@ import androidx.core.content.ContextCompat
 import com.example.GatekeeperActivity
 import com.example.MainActivity
 import com.example.data.AppGuardRuntimeCache
+import com.example.data.entity.DisguiseIdentity
 import com.example.data.entity.NotificationPrivacyMode
+import com.example.launcher.LauncherDisguiseManager
 
 class AppGuardAccessibilityService : AccessibilityService() {
 
@@ -32,9 +35,12 @@ class AppGuardAccessibilityService : AccessibilityService() {
         pendingTimerPkg = null
     }
 
+    private var lastSettingsProbeMillis: Long = 0L
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         AppGuardRuntimeCache.setAccessibilityConnected(true)
+        AppGuardRuntimeCache.bumpRestrictionStateVersion()
 
         if (screenOffReceiver == null) {
             val receiver = object : BroadcastReceiver() {
@@ -56,11 +62,22 @@ class AppGuardAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         AppGuardRuntimeCache.setAccessibilityConnected(false)
+        AppGuardRuntimeCache.bumpRestrictionStateVersion()
         mainHandler.removeCallbacks(timerExpireRunnable)
         pendingTimerPkg = null
         screenOffReceiver?.let { runCatching { unregisterReceiver(it) } }
         screenOffReceiver = null
         return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        AppGuardRuntimeCache.setAccessibilityConnected(false)
+        AppGuardRuntimeCache.bumpRestrictionStateVersion()
+        mainHandler.removeCallbacks(timerExpireRunnable)
+        pendingTimerPkg = null
+        screenOffReceiver?.let { runCatching { unregisterReceiver(it) } }
+        screenOffReceiver = null
+        super.onDestroy()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -126,7 +143,10 @@ class AppGuardAccessibilityService : AccessibilityService() {
             updateForegroundSessionAndTimer(pkg, now)
         }
 
-        if (pkg == packageName) return
+        if (pkg == packageName) {
+            lastVaultGuardSettingsAtMillis = 0L
+            return
+        }
 
         if (isLauncherPackage(pkg)) {
             lastVaultGuardSettingsAtMillis = 0L
@@ -170,6 +190,13 @@ class AppGuardAccessibilityService : AccessibilityService() {
         if (!isSettings && !isInstaller) {
             lastVaultGuardSettingsAtMillis = 0L
             return
+        }
+
+        if (isSettings && AppGuardRuntimeCache.activeSetupPackage != null &&
+            (now - lastSettingsProbeMillis) >= 400L
+        ) {
+            lastSettingsProbeMillis = now
+            AppGuardRuntimeCache.bumpRestrictionStateVersion()
         }
 
         if (config.uninstallProtectionEnabled &&
@@ -282,7 +309,19 @@ class AppGuardAccessibilityService : AccessibilityService() {
 
         if (matched) {
             lastWakeTriggerMillis = now
-            val intent = Intent(this, MainActivity::class.java).apply {
+            val disguise = LauncherDisguiseManager.resolveEffectiveDisguise(
+                disguise = DisguiseIdentity.fromName(config.disguiseName),
+                hideFromLauncher = config.isAppHidden,
+            )
+            val aliasManager = LauncherDisguiseManager(this)
+            val targetComponent = if (aliasManager.isAliasEnabled(disguise)) {
+                ComponentName(packageName, disguise.aliasClassName)
+            } else {
+                ComponentName(this, MainActivity::class.java)
+            }
+            val intent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                component = targetComponent
                 addFlags(
                     Intent.FLAG_ACTIVITY_NEW_TASK or
                         Intent.FLAG_ACTIVITY_CLEAR_TOP or

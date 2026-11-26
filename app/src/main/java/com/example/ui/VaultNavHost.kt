@@ -30,11 +30,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -46,9 +45,9 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.R
 import com.example.data.entity.DisguiseIdentity
+import com.example.restriction.SystemRequirementIssue
 import com.example.ui.screens.AppsScreen
 import com.example.ui.screens.DashboardScreen
-import com.example.ui.screens.DisguiseStealthScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.VaultScreen
 
@@ -56,7 +55,6 @@ object VaultRoutes {
     const val GUARD = "guard"
     const val APPS = "apps"
     const val VAULT = "vault"
-    const val DISGUISE = "disguise"
     const val SETTINGS = "settings"
 }
 
@@ -106,10 +104,10 @@ fun VaultConsoleHost(
     onOpenAccessibilitySettings: () -> Unit,
     onRequestDeviceAdmin: () -> Unit,
     onOpenNotificationListenerSettings: () -> Unit,
-    onOpenNotificationPolicySettings: () -> Unit,
     onSuppressNextBackgroundLock: () -> Unit,
     onSignOut: () -> Unit,
 ) {
+    val context = LocalContext.current
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = backStackEntry?.destination
@@ -130,6 +128,18 @@ fun VaultConsoleHost(
             }
             launchSingleTop = true
             restoreState = true
+        }
+    }
+
+    fun handleSystemIssue(issue: SystemRequirementIssue) {
+        onSuppressNextBackgroundLock()
+        when (issue) {
+            SystemRequirementIssue.ACCESSIBILITY -> onOpenAccessibilitySettings()
+            SystemRequirementIssue.NOTIFICATION_LISTENER -> onOpenNotificationListenerSettings()
+            SystemRequirementIssue.DEVICE_ADMIN -> onRequestDeviceAdmin()
+            SystemRequirementIssue.CAMERA,
+            SystemRequirementIssue.POST_NOTIFICATIONS,
+            -> Unit
         }
     }
 
@@ -202,11 +212,7 @@ fun VaultConsoleHost(
                             DashboardScreen(
                                 state = state,
                                 onNavigateToApps = { navigateToTab(VaultRoutes.APPS) },
-                                onNavigateToDisguise = {
-                                    navController.navigate(VaultRoutes.DISGUISE) {
-                                        launchSingleTop = true
-                                    }
-                                },
+                                onFixSystemIssue = ::handleSystemIssue,
                                 onRefreshSystemStatus = viewModel::refreshSystemStatus,
                                 onClearLogs = viewModel::clearLogs,
                                 onCheckForUpdates = viewModel::checkForUpdates,
@@ -228,6 +234,23 @@ fun VaultConsoleHost(
                                 onToggleSystemApps = viewModel::setShowSystemApps,
                                 onSetAppGuardRule = viewModel::setAppGuardRule,
                                 onRefreshApps = viewModel::refreshInstalledApps,
+                                onLaunchSystemStep = { pkg, step ->
+                                    viewModel.onGuidedSystemStepOpened(pkg, step)
+                                    val intents = viewModel.buildSystemSettingsIntentChain(step)
+                                    onSuppressNextBackgroundLock()
+                                    val launched = intents.any { intent ->
+                                        runCatching { context.startActivity(intent) }.isSuccess
+                                    }
+                                    if (!launched) {
+                                        viewModel.showStatusBanner("Unable to open system settings for ${step.title}.")
+                                    }
+                                },
+                                onFixSystemIssue = ::handleSystemIssue,
+                                onRefreshSystemStatus = viewModel::refreshSystemStatus,
+                                onSuppressNextBackgroundLock = onSuppressNextBackgroundLock,
+                                onInspectApp = viewModel::inspectAppForConfig,
+                                onClearInspectedApp = viewModel::clearInspectedAppForConfig,
+                                onClearPendingEndRestriction = viewModel::clearPendingEndRestriction,
                             )
                         }
                         composable(VaultRoutes.VAULT) {
@@ -245,22 +268,6 @@ fun VaultConsoleHost(
                                 onSuppressNextBackgroundLock = onSuppressNextBackgroundLock,
                             )
                         }
-                        composable(VaultRoutes.DISGUISE) {
-                            DisguiseStealthScreen(
-                                state = state,
-                                onApplyDisguiseAndHide = { identity: DisguiseIdentity, hide: Boolean ->
-                                    viewModel.applyDisguiseAndHiddenState(identity, hide)
-                                },
-                                onUpdateRedirectDisplay = viewModel::setRedirectDisplayStyle,
-                                onUpdateStealthTriggers = viewModel::updateStealthTriggers,
-                                onVerifyAdminPassword = viewModel::verifyAdminPassword,
-                                onOpenAccessibilitySettings = {
-                                    onSuppressNextBackgroundLock()
-                                    onOpenAccessibilitySettings()
-                                },
-                                onNavigateBack = { navController.popBackStack() },
-                            )
-                        }
                         composable(VaultRoutes.SETTINGS) {
                             SettingsScreen(
                                 state = state,
@@ -276,16 +283,15 @@ fun VaultConsoleHost(
                                     onSuppressNextBackgroundLock()
                                     onOpenNotificationListenerSettings()
                                 },
-                                onOpenNotificationPolicySettings = {
-                                    onSuppressNextBackgroundLock()
-                                    onOpenNotificationPolicySettings()
-                                },
                                 onToggleNotificationBlock = viewModel::setNotificationBlockEnabled,
                                 onToggleCapturePhoto = viewModel::setCapturePhotoOnOpenEnabled,
                                 onRefreshSystemStatus = viewModel::refreshSystemStatus,
                                 onToggleUninstallGuard = viewModel::setUninstallProtection,
                                 onToggleInstallGuard = viewModel::setInstallGuard,
                                 onUpdateStealthTriggers = viewModel::updateStealthTriggers,
+                                onApplyDisguiseAndHide = { identity: DisguiseIdentity, hide: Boolean ->
+                                    viewModel.applyDisguiseAndHiddenState(identity, hide)
+                                },
                                 onUpdateRedirectDisplay = viewModel::setRedirectDisplayStyle,
                                 onSetRedirectDecoyMode = viewModel::setRedirectDecoyMode,
                                 onSetImmediateLockTimeoutSeconds = viewModel::setImmediateLockTimeoutSeconds,
@@ -304,4 +310,3 @@ fun VaultConsoleHost(
         }
     }
 }
-

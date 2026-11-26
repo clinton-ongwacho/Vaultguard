@@ -1,14 +1,12 @@
 package com.example.service
 
 import android.app.Notification
-import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
-import android.service.notification.NotificationListenerService
 import androidx.core.os.BundleCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,7 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Pure classification helpers for detecting incoming VoIP/app calls and their Decline actions.
+ * Pure universal classification helpers for detecting incoming VoIP/app calls and Decline actions.
  */
 object CallNotificationClassifier {
 
@@ -76,23 +74,23 @@ object CallNotificationClassifier {
 }
 
 /**
- * Silences ringtones, notification audio, and vibration when a restricted app receives an incoming
- * call or alert, and safely restores the user's previous audio / DND state afterward.
+ * Interrupts incoming call audio for restricted applications using per-call transient ringtone
+ * audio focus and call-decline PendingIntents. Never enables global Do Not Disturb or mutes
+ * unrelated applications.
  */
 object CallSilenceHelper {
 
     private const val EXTRA_DECLINE_INTENT = "android.declineIntent"
-    private const val MAX_CALL_SILENCE_MS = 40_000L
+    private const val FOCUS_HOLD_MS = 2_400L
+    private const val MAX_CALL_FOCUS_MS = 12_000L
 
     private val lock = Any()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private var restoreJob: Job? = null
-    private var isSilencingActive = false
-    private var savedInterruptionFilter: Int? = null
-    private var savedRingerMode: Int? = null
-    private var silenceStartMillis: Long = 0L
-    private var silenceUntilMillis: Long = 0L
+    private var isFocusActive = false
+    private var focusStartMillis: Long = 0L
+    private var focusUntilMillis: Long = 0L
     private var activeAudioFocusRequest: AudioFocusRequest? = null
 
     fun isIncomingCallNotification(notification: Notification): Boolean {
@@ -129,64 +127,26 @@ object CallSilenceHelper {
         return null
     }
 
-    fun silenceRestrictedAlert(
-        context: Context,
-        listener: NotificationListenerService?,
-        isCall: Boolean,
-    ) {
+    /**
+     * Scopes transient ringtone audio focus strictly to active restricted call interruptions.
+     * Does NOT alter global Do Not Disturb or system ringer mode.
+     */
+    fun interruptRestrictedCallAudio(context: Context) {
         val appContext = context.applicationContext
-        val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        val notificationManager =
-            appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         val now = System.currentTimeMillis()
-        val durationMs = if (isCall) 5_000L else 1_500L
 
         synchronized(lock) {
-            if (!isSilencingActive) {
-                isSilencingActive = true
-                silenceStartMillis = now
-                savedInterruptionFilter = listener?.let { runCatching { it.currentInterruptionFilter }.getOrNull() }
-                if (audioManager != null && notificationManager?.isNotificationPolicyAccessGranted == true) {
-                    savedRingerMode = runCatching { audioManager.ringerMode }.getOrNull()
-                } else {
-                    savedRingerMode = null
-                }
-            }
-            silenceUntilMillis = maxOf(silenceUntilMillis, now + durationMs)
-
-            // 1. Apply Do Not Disturb (Alarms Only) via NotificationListenerService to silence
-            // both ringtone audio and vibration immediately.
-            listener?.let { nls ->
-                val targetFilter = NotificationListenerService.INTERRUPTION_FILTER_ALARMS
-                val currentFilter = runCatching { nls.currentInterruptionFilter }.getOrNull()
-                if (currentFilter != NotificationListenerService.INTERRUPTION_FILTER_NONE &&
-                    currentFilter != targetFilter
-                ) {
-                    runCatching { nls.requestInterruptionFilter(targetFilter) }
-                }
-            }
-
-            // 2. Directly silence ring/notification streams when Notification Policy Access is granted.
-            if (audioManager != null && notificationManager?.isNotificationPolicyAccessGranted == true) {
-                runCatching {
-                    audioManager.ringerMode = AudioManager.RINGER_MODE_SILENT
-                }
-                runCatching {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_RING, AudioManager.ADJUST_MUTE, 0)
-                }
-                runCatching {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_MUTE, 0)
-                }
-            }
-
-            // 3. Request transient audio focus on calls to interrupt custom ringtone MediaPlayers.
-            if (isCall && audioManager != null && activeAudioFocusRequest == null) {
+            if (!isFocusActive) {
+                isFocusActive = true
+                focusStartMillis = now
                 requestTransientRingFocus(audioManager)
             }
+            focusUntilMillis = maxOf(focusUntilMillis, now + FOCUS_HOLD_MS)
 
             if (restoreJob?.isActive != true) {
                 restoreJob = scope.launch {
-                    monitorAndRestore(appContext, listener, watchRingMode = isCall)
+                    monitorAndAbandon(audioManager)
                 }
             }
         }
@@ -196,84 +156,47 @@ object CallSilenceHelper {
         val audioManager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             ?: return
         if (audioManager.mode == AudioManager.MODE_RINGTONE) {
-            silenceRestrictedAlert(context = context, listener = null, isCall = true)
+            interruptRestrictedCallAudio(context)
         }
     }
 
-    fun restoreIfActive(context: Context, listener: NotificationListenerService?) {
-        val appContext = context.applicationContext
-        val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        val notificationManager =
-            appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-
+    fun releaseIfActive(context: Context) {
+        val audioManager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         synchronized(lock) {
             restoreJob?.cancel()
             restoreJob = null
-            if (!isSilencingActive) return
-            restoreLocked(audioManager, notificationManager, listener)
+            if (!isFocusActive) return
+            abandonLocked(audioManager)
         }
     }
 
-    private suspend fun monitorAndRestore(
-        appContext: Context,
-        listener: NotificationListenerService?,
-        watchRingMode: Boolean,
-    ) {
-        val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        val notificationManager =
-            appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-
+    private suspend fun monitorAndAbandon(audioManager: AudioManager) {
         while (true) {
-            delay(600L)
+            delay(400L)
             val now = System.currentTimeMillis()
-            val shouldContinue = synchronized(lock) {
-                if (!isSilencingActive) return@synchronized false
-                val withinHardCap = (now - silenceStartMillis) < MAX_CALL_SILENCE_MS
-                val stillRinging = watchRingMode && audioManager?.mode == AudioManager.MODE_RINGTONE
-                if (now < silenceUntilMillis) {
+            val keepGoing = synchronized(lock) {
+                if (!isFocusActive) return@synchronized false
+                val withinCap = (now - focusStartMillis) < MAX_CALL_FOCUS_MS
+                val stillRinging = audioManager.mode == AudioManager.MODE_RINGTONE
+                if (now < focusUntilMillis) {
                     true
-                } else if (stillRinging && withinHardCap) {
-                    silenceUntilMillis = now + 1_200L
+                } else if (stillRinging && withinCap) {
+                    focusUntilMillis = now + 900L
                     true
                 } else {
-                    restoreLocked(audioManager, notificationManager, listener)
+                    abandonLocked(audioManager)
                     false
                 }
             }
-            if (!shouldContinue) break
+            if (!keepGoing) break
         }
     }
 
-    private fun restoreLocked(
-        audioManager: AudioManager?,
-        notificationManager: NotificationManager?,
-        listener: NotificationListenerService?,
-    ) {
+    private fun abandonLocked(audioManager: AudioManager?) {
         abandonTransientRingFocus(audioManager)
-
-        savedInterruptionFilter?.let { prevFilter ->
-            listener?.let { nls ->
-                runCatching { nls.requestInterruptionFilter(prevFilter) }
-            }
-        }
-
-        if (audioManager != null && notificationManager?.isNotificationPolicyAccessGranted == true) {
-            runCatching {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_RING, AudioManager.ADJUST_UNMUTE, 0)
-            }
-            runCatching {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_UNMUTE, 0)
-            }
-            savedRingerMode?.let { prevMode ->
-                runCatching { audioManager.ringerMode = prevMode }
-            }
-        }
-
-        isSilencingActive = false
-        savedInterruptionFilter = null
-        savedRingerMode = null
-        silenceStartMillis = 0L
-        silenceUntilMillis = 0L
+        isFocusActive = false
+        focusStartMillis = 0L
+        focusUntilMillis = 0L
     }
 
     private fun requestTransientRingFocus(audioManager: AudioManager) {

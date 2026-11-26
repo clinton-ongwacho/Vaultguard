@@ -7,6 +7,7 @@ import com.example.security.PasswordHasher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -43,6 +44,9 @@ object AppGuardRuntimeCache {
     @Volatile
     var uninstallAuthorizedUntilMillis: Long = 0L
 
+    @Volatile
+    var activeSetupPackage: String? = null
+
     private val _accessibilityConnected = MutableStateFlow(false)
     val accessibilityConnected: StateFlow<Boolean> = _accessibilityConnected.asStateFlow()
 
@@ -52,12 +56,30 @@ object AppGuardRuntimeCache {
     private val _blockingVersion = MutableStateFlow(0L)
     val blockingVersion: StateFlow<Long> = _blockingVersion.asStateFlow()
 
+    private val _restrictionStateVersion = MutableStateFlow(0L)
+    val restrictionStateVersion: StateFlow<Long> = _restrictionStateVersion.asStateFlow()
+
+    private val _foregroundActive = MutableStateFlow(false)
+    val foregroundActive: StateFlow<Boolean> = _foregroundActive.asStateFlow()
+
     fun setAccessibilityConnected(connected: Boolean) {
         _accessibilityConnected.value = connected
     }
 
     fun setNotificationListenerConnected(connected: Boolean) {
         _notificationListenerConnected.value = connected
+    }
+
+    fun setForegroundActive(active: Boolean) {
+        _foregroundActive.value = active
+    }
+
+    fun bumpBlockingVersion() {
+        _blockingVersion.value += 1
+    }
+
+    fun bumpRestrictionStateVersion() {
+        _restrictionStateVersion.value += 1
     }
 
     fun updateConfig(newConfig: AdminConfigEntity) {
@@ -166,7 +188,32 @@ object AppGuardRuntimeCache {
             .map { it.packageName }
     }
 
+    fun allLimitedPackageNames(): List<String> =
+        limitedRules.values.filter { it.isLimited }.map { it.packageName }
+
     fun getRule(packageName: String): LimitedAppEntity? = limitedRules[packageName]
+
+    @Volatile
+    private var pendingDisguiseSwitchUnlockToken: String? = null
+
+    @Volatile
+    private var pendingDisguiseSwitchUnlockExpiresAt: Long = 0L
+
+    fun issueDisguiseSwitchUnlockToken(): String {
+        val token = UUID.randomUUID().toString()
+        pendingDisguiseSwitchUnlockToken = token
+        pendingDisguiseSwitchUnlockExpiresAt = System.currentTimeMillis() + 8_000L
+        return token
+    }
+
+    fun consumeDisguiseSwitchUnlockToken(token: String?): Boolean {
+        if (token.isNullOrBlank()) return false
+        val valid = token == pendingDisguiseSwitchUnlockToken &&
+            System.currentTimeMillis() <= pendingDisguiseSwitchUnlockExpiresAt
+        pendingDisguiseSwitchUnlockToken = null
+        pendingDisguiseSwitchUnlockExpiresAt = 0L
+        return valid
+    }
 
     fun activeDisguiseLabel(): String =
         DisguiseIdentity.fromName(config.disguiseName).displayLabel

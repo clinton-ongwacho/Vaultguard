@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -26,6 +27,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.AppGuardRuntimeCache
 import com.example.data.entity.DisguiseIdentity
+import com.example.launcher.LauncherDisguiseManager
 import com.example.security.GoogleAuthHelper
 import com.example.security.GoogleAuthHelper.authStateFlow
 import com.example.service.VaultDeviceAdminReceiver
@@ -47,11 +49,14 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val EXTRA_STEALTH_WAKE = "extra_stealth_wake"
         const val EXTRA_WAKE_SOURCE = "extra_wake_source"
+        const val EXTRA_HANDOFF_TARGET_ALIAS = "extra_handoff_target_alias"
+        const val EXTRA_PRESERVE_UNLOCK_TOKEN = "extra_preserve_unlock_token"
     }
 
     private val resumeTick = MutableStateFlow(0)
     private val backgroundLockTick = MutableStateFlow(0)
     private val pendingStealthWake = MutableStateFlow<String?>(null)
+    private val pendingAliasHandoffUnlock = MutableStateFlow(false)
 
     @Volatile
     private var suppressNextBackgroundLock: Boolean = false
@@ -60,8 +65,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enforceSecureScreen()
         enableEdgeToEdge()
-        handleStealthIntent(intent)
+        LauncherDisguiseManager.applyRecentsIdentity(
+            activity = this,
+            disguise = DisguiseIdentity.fromName(AppGuardRuntimeCache.config.disguiseName),
+            hideFromLauncher = AppGuardRuntimeCache.config.isAppHidden,
+        )
+        handleIncomingIntent(intent)
 
         val app = application as VaultGuardApp
 
@@ -114,11 +125,36 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
+                        val aliasHandoffUnlock by pendingAliasHandoffUnlock.collectAsStateWithLifecycle()
+                        LaunchedEffect(aliasHandoffUnlock) {
+                            if (aliasHandoffUnlock) {
+                                viewModel.restoreSessionUnlockedFromAliasHandoff()
+                                pendingAliasHandoffUnlock.value = false
+                            }
+                        }
+
                         val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-                        LaunchedEffect(uiState.config.isAppHidden, tick) {
+                        LaunchedEffect(
+                            uiState.isConfigLoaded,
+                            uiState.activeDisguise,
+                            uiState.config.isAppHidden,
+                            tick,
+                        ) {
+                            LauncherDisguiseManager.applyRecentsIdentity(
+                                activity = this@MainActivity,
+                                disguise = uiState.activeDisguise,
+                                hideFromLauncher = uiState.config.isAppHidden,
+                            )
                             val am = getSystemService(ACTIVITY_SERVICE) as? ActivityManager
                             am?.appTasks?.forEach { task ->
                                 runCatching { task.setExcludeFromRecents(uiState.config.isAppHidden) }
+                            }
+                            if (uiState.isConfigLoaded) {
+                                handoffTaskToActiveDisguiseAliasIfNeeded(
+                                    disguise = uiState.activeDisguise,
+                                    isAppHidden = uiState.config.isAppHidden,
+                                    preserveUnlock = uiState.isSessionUnlocked,
+                                )
                             }
                         }
                         var showUnlockFromDisguise by remember(
@@ -158,7 +194,6 @@ class MainActivity : ComponentActivity() {
                                     onOpenAccessibilitySettings = ::openAccessibilitySettings,
                                     onRequestDeviceAdmin = ::requestOrManageDeviceAdmin,
                                     onOpenNotificationListenerSettings = ::openNotificationListenerSettings,
-                                    onOpenNotificationPolicySettings = ::openNotificationPolicyAccessSettings,
                                     onSuppressNextBackgroundLock = {
                                         suppressNextBackgroundLock = true
                                     },
@@ -213,18 +248,40 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleStealthIntent(intent)
+        handleIncomingIntent(intent)
     }
 
     override fun onResume() {
         super.onResume()
+        enforceSecureScreen()
         suppressNextBackgroundLock = false
+        AppGuardRuntimeCache.setForegroundActive(true)
         AppGuardRuntimeCache.onForegroundPackageChanged(packageName, System.currentTimeMillis())
+        LauncherDisguiseManager.applyRecentsIdentity(
+            activity = this,
+            disguise = DisguiseIdentity.fromName(AppGuardRuntimeCache.config.disguiseName),
+            hideFromLauncher = AppGuardRuntimeCache.config.isAppHidden,
+        )
+        activeViewModel?.refreshSystemStatus()
         resumeTick.value += 1
+    }
+
+    override fun onPause() {
+        AppGuardRuntimeCache.setForegroundActive(false)
+        super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            activeViewModel?.refreshSystemStatus()
+            resumeTick.value += 1
+        }
     }
 
     override fun onStop() {
         super.onStop()
+        AppGuardRuntimeCache.setForegroundActive(false)
         if (!isChangingConfigurations) {
             activeViewModel?.lockVaultMedia()
             if (!suppressNextBackgroundLock) {
@@ -234,10 +291,60 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun handleStealthIntent(intent: Intent?) {
+    private fun enforceSecureScreen() {
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
         if (intent?.getBooleanExtra(EXTRA_STEALTH_WAKE, false) == true) {
             pendingStealthWake.value = intent.getStringExtra(EXTRA_WAKE_SOURCE) ?: "Stealth"
         }
+        val handoffToken = intent?.getStringExtra(EXTRA_PRESERVE_UNLOCK_TOKEN)
+        if (AppGuardRuntimeCache.consumeDisguiseSwitchUnlockToken(handoffToken)) {
+            pendingAliasHandoffUnlock.value = true
+        }
+    }
+
+    private fun handoffTaskToActiveDisguiseAliasIfNeeded(
+        disguise: DisguiseIdentity,
+        isAppHidden: Boolean,
+        preserveUnlock: Boolean,
+    ) {
+        if (isFinishing || isDestroyed) return
+        val effective = LauncherDisguiseManager.resolveEffectiveDisguise(disguise, isAppHidden)
+        val desiredAlias = effective.aliasClassName
+        val currentComponentClass = intent?.component?.className
+        if (currentComponentClass == desiredAlias) return
+        if (intent?.getStringExtra(EXTRA_HANDOFF_TARGET_ALIAS) == desiredAlias) return
+
+        val aliasManager = LauncherDisguiseManager(this)
+        if (!aliasManager.isAliasEnabled(effective)) return
+
+        val handoffIntent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            component = ComponentName(packageName, desiredAlias)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            putExtra(EXTRA_HANDOFF_TARGET_ALIAS, desiredAlias)
+            if (intent?.getBooleanExtra(EXTRA_STEALTH_WAKE, false) == true) {
+                putExtra(EXTRA_STEALTH_WAKE, true)
+                putExtra(EXTRA_WAKE_SOURCE, intent?.getStringExtra(EXTRA_WAKE_SOURCE))
+            }
+            if (preserveUnlock) {
+                putExtra(
+                    EXTRA_PRESERVE_UNLOCK_TOKEN,
+                    AppGuardRuntimeCache.issueDisguiseSwitchUnlockToken(),
+                )
+            }
+        }
+
+        if (packageManager.resolveActivity(handoffIntent, 0) == null) return
+
+        suppressNextBackgroundLock = true
+        startActivity(handoffIntent)
+        finishAndRemoveTask()
     }
 
     private fun openAccessibilitySettings() {
@@ -251,14 +358,6 @@ class MainActivity : ComponentActivity() {
     private fun openNotificationListenerSettings() {
         suppressNextBackgroundLock = true
         val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        runCatching { startActivity(intent) }
-    }
-
-    private fun openNotificationPolicyAccessSettings() {
-        suppressNextBackgroundLock = true
-        val intent = Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         runCatching { startActivity(intent) }

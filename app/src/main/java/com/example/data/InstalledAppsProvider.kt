@@ -2,6 +2,7 @@ package com.example.data
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.os.Build
@@ -13,6 +14,7 @@ data class InstalledAppInfo(
     val appName: String,
     val icon: Drawable?,
     val isSystemApp: Boolean,
+    val category: Int = ApplicationInfo.CATEGORY_UNDEFINED,
 )
 
 class InstalledAppsProvider(private val context: Context) {
@@ -41,8 +43,13 @@ class InstalledAppsProvider(private val context: Context) {
             val drawable = runCatching { info.loadIcon(pm) }.getOrNull()
             val appInfo = info.activityInfo?.applicationInfo
             val isSystem = appInfo != null &&
-                ((appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) &&
-                ((appInfo.flags and android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0)
+                ((appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0) &&
+                ((appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0)
+            val category = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && appInfo != null) {
+                appInfo.category
+            } else {
+                ApplicationInfo.CATEGORY_UNDEFINED
+            }
 
             result.add(
                 InstalledAppInfo(
@@ -50,6 +57,7 @@ class InstalledAppsProvider(private val context: Context) {
                     appName = label,
                     icon = drawable,
                     isSystemApp = isSystem,
+                    category = category,
                 )
             )
         }
@@ -68,11 +76,17 @@ class InstalledAppsProvider(private val context: Context) {
             }
             val label = pm.getApplicationLabel(appInfo).toString()
             val icon = runCatching { pm.getApplicationIcon(appInfo) }.getOrNull()
+            val category = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appInfo.category
+            } else {
+                ApplicationInfo.CATEGORY_UNDEFINED
+            }
             InstalledAppInfo(
                 packageName = packageName,
                 appName = label,
                 icon = icon,
-                isSystemApp = (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0,
+                isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
+                category = category,
             )
         } catch (_: Exception) {
             null

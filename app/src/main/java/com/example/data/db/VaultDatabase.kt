@@ -9,6 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.data.entity.AccessEventEntity
 import com.example.data.entity.AdminConfigEntity
 import com.example.data.entity.LimitedAppEntity
+import com.example.data.entity.RestrictedAppStateEntity
 import com.example.data.entity.SecurityQuestionEntity
 
 @Database(
@@ -17,8 +18,9 @@ import com.example.data.entity.SecurityQuestionEntity
         LimitedAppEntity::class,
         AccessEventEntity::class,
         SecurityQuestionEntity::class,
+        RestrictedAppStateEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = false,
 )
 abstract class VaultDatabase : RoomDatabase() {
@@ -95,6 +97,22 @@ abstract class VaultDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `restricted_app_states` (
+                        `packageName` TEXT NOT NULL PRIMARY KEY,
+                        `snapshotJson` TEXT NOT NULL DEFAULT '',
+                        `discoveredChannelsJson` TEXT NOT NULL DEFAULT '[]',
+                        `lastVerificationState` TEXT NOT NULL DEFAULT 'UNRESTRICTED',
+                        `lastInspectedAtMillis` INTEGER NOT NULL DEFAULT 0
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): VaultDatabase {
             return instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -109,6 +127,7 @@ abstract class VaultDatabase : RoomDatabase() {
                         MIGRATION_6_7,
                         MIGRATION_7_8,
                         MIGRATION_8_9,
+                        MIGRATION_9_10,
                     )
                     .fallbackToDestructiveMigration(true)
                     .build()

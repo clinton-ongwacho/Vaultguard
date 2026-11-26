@@ -6,8 +6,11 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.TextUtils
 import androidx.core.content.ContextCompat
@@ -17,6 +20,7 @@ import com.example.data.InstalledAppInfo
 import com.example.data.InstalledAppsProvider
 import com.example.data.VaultImportResult
 import com.example.data.VaultMediaManager
+import com.example.data.db.AppRestrictionFrequency
 import com.example.data.db.VaultDao
 import com.example.data.entity.AccessEventEntity
 import com.example.data.entity.AdminConfigEntity
@@ -29,12 +33,18 @@ import com.example.data.entity.RedirectDisplayStyle
 import com.example.data.entity.SecurityQuestionEntity
 import com.example.data.entity.VaultMediaEntity
 import com.example.launcher.LauncherDisguiseManager
+import com.example.restriction.DeepRestrictionEngine
+import com.example.restriction.PackageInspectionReport
+import com.example.restriction.SystemIntegrityStatus
+import com.example.restriction.SystemRestrictionStep
 import com.example.security.PasswordHasher
 import com.example.security.SecretCipher
 import com.example.service.AppGuardAccessibilityService
 import com.example.service.VaultDeviceAdminReceiver
 import com.example.service.VaultNotificationListenerService
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.map
 
 class VaultRepository(
@@ -43,16 +53,19 @@ class VaultRepository(
     private val appsProvider: InstalledAppsProvider,
     private val launcherManager: LauncherDisguiseManager,
     private val vaultMediaManager: VaultMediaManager = VaultMediaManager(context),
+    private val deepRestrictionEngine: DeepRestrictionEngine = DeepRestrictionEngine(context, dao),
 ) {
     val configFlow: Flow<AdminConfigEntity> = dao.observeConfig().map { it ?: AdminConfigEntity() }
     val limitedAppsFlow: Flow<List<LimitedAppEntity>> = dao.observeLimitedApps()
     val recentEventsFlow: Flow<List<AccessEventEntity>> = dao.observeRecentEvents()
+    val appRestrictionFrequenciesFlow: Flow<List<AppRestrictionFrequency>> = dao.observeRestrictionEventFrequencies()
     val vaultMediaFlow: Flow<List<VaultMediaEntity>> = vaultMediaManager.vaultMediaFlow
     val securityQuestionsFlow: Flow<List<SecurityQuestionEntity>> = dao.observeSecurityQuestions()
 
     suspend fun syncRuntimeCache() {
         val config = dao.getConfigOnce() ?: AdminConfigEntity().also { dao.upsertConfig(it) }
         val rules = dao.getLimitedAppsOnce()
+        deepRestrictionEngine.hydrateTrackedChannelsFromDb()
         AppGuardRuntimeCache.updateConfig(config)
         AppGuardRuntimeCache.updateLimitedApps(rules)
     }
@@ -273,6 +286,7 @@ class VaultRepository(
         disguise: DisguiseIdentity,
         hideFromLauncher: Boolean,
     ) {
+        launcherManager.applyLauncherState(disguise, hideFromLauncher)
         val current = dao.getConfigOnce() ?: AdminConfigEntity()
         val updated = current.copy(
             disguiseName = disguise.name,
@@ -280,7 +294,6 @@ class VaultRepository(
         )
         dao.upsertConfig(updated)
         AppGuardRuntimeCache.updateConfig(updated)
-        launcherManager.applyLauncherState(disguise, hideFromLauncher)
         logEvent(
             context.packageName,
             disguise.displayLabel,
@@ -347,7 +360,7 @@ class VaultRepository(
         appName: String,
         guardMode: AppGuardMode,
         privacyMode: NotificationPrivacyMode = NotificationPrivacyMode.SILENT_AND_HIDE,
-    ): Result<Unit> {
+    ): Result<PackageInspectionReport> {
         val config = dao.getConfigOnce()
         if (guardMode != AppGuardMode.NONE && config?.isInitialized != true) {
             return Result.failure(IllegalStateException("Set Admin password first."))
@@ -359,32 +372,109 @@ class VaultRepository(
         } else {
             existing?.notificationPrivacyEnum ?: NotificationPrivacyMode.SILENT_AND_HIDE
         }
-        val updated = (existing ?: LimitedAppEntity(packageName = packageName, appName = appName))
-            .copy(
+
+        val integrity = computeSystemIntegrityStatus(config, dao.getLimitedAppsOnce())
+        val silentAndHide = effectivePrivacy == NotificationPrivacyMode.SILENT_AND_HIDE
+
+        if (isLimited) {
+            val preReport = deepRestrictionEngine.inspectSingleApp(
+                packageName = packageName,
                 appName = appName,
-                isLimited = isLimited,
-                guardMode = AppGuardMode.RESTRICTED.name,
-                notificationPrivacyMode = effectivePrivacy.name,
-                tempUnlockUntilMillis = 0L,
+                isRestricted = true,
+                silentAndHide = silentAndHide,
+                integrity = integrity,
             )
-        dao.upsertLimitedApp(updated)
-        syncRuntimeCache()
-        val detail = if (isLimited) {
-            if (effectivePrivacy == NotificationPrivacyMode.SILENT_AND_HIDE) {
-                "Restricted • Silent & Hidden"
-            } else {
-                "Restricted • Show, Hide Content"
+            if (!preReport.canApplyRestriction) {
+                logEvent(
+                    packageName = packageName,
+                    appName = appName,
+                    eventType = "RESTRICTION_PERMISSIONS_REQUIRED",
+                    detail = when {
+                        preReport.missingCorePermissions.isNotEmpty() ->
+                            "Missing ${preReport.missingCorePermissions.joinToString(", ")}"
+                        else ->
+                            "${preReport.pendingSystemSteps.size} system approval(s) required"
+                    },
+                )
+                return Result.success(
+                    preReport.copy(isRestricted = existing?.isLimited == true)
+                )
             }
+        }
+
+        val report = if (isLimited) {
+            val updated = (existing ?: LimitedAppEntity(packageName = packageName, appName = appName))
+                .copy(
+                    appName = appName,
+                    isLimited = true,
+                    guardMode = AppGuardMode.RESTRICTED.name,
+                    notificationPrivacyMode = effectivePrivacy.name,
+                    tempUnlockUntilMillis = 0L,
+                )
+            dao.upsertLimitedApp(updated)
+            syncRuntimeCache()
+            deepRestrictionEngine.applyRestrictionWithSnapshot(
+                packageName = packageName,
+                appName = appName,
+                privacyMode = effectivePrivacy,
+                integrity = integrity,
+            )
         } else {
-            "Unrestricted"
+            val (ended, restoreReport) = deepRestrictionEngine.tryEndRestrictionAfterRestore(
+                packageName = packageName,
+                appName = appName,
+                silentAndHide = silentAndHide,
+                integrity = integrity,
+            )
+            if (ended) {
+                val updated = (existing ?: LimitedAppEntity(packageName = packageName, appName = appName))
+                    .copy(
+                        appName = appName,
+                        isLimited = false,
+                        guardMode = AppGuardMode.NONE.name,
+                        notificationPrivacyMode = effectivePrivacy.name,
+                        tempUnlockUntilMillis = 0L,
+                    )
+                dao.upsertLimitedApp(updated)
+                syncRuntimeCache()
+            } else if (existing?.isLimited != true) {
+                val keptRestricted = (existing ?: LimitedAppEntity(packageName = packageName, appName = appName))
+                    .copy(
+                        appName = appName,
+                        isLimited = true,
+                        guardMode = AppGuardMode.RESTRICTED.name,
+                        notificationPrivacyMode = effectivePrivacy.name,
+                        tempUnlockUntilMillis = 0L,
+                    )
+                dao.upsertLimitedApp(keptRestricted)
+                syncRuntimeCache()
+            }
+            restoreReport
+        }
+
+        val detail = when {
+            isLimited -> {
+                val privText = if (effectivePrivacy == NotificationPrivacyMode.SILENT_AND_HIDE) {
+                    "Silent & Hidden"
+                } else {
+                    "Show, Hide Content"
+                }
+                "Restricted • $privText • ${report.statusBadgeText}"
+            }
+            report.isRestricted -> "Restore required (${report.restoreSteps.size} setting(s) still off)"
+            else -> "Unrestricted"
         }
         logEvent(
             packageName = packageName,
             appName = appName,
-            eventType = if (isLimited) "APP_RESTRICTED" else "APP_UNRESTRICTED",
+            eventType = when {
+                isLimited -> "APP_RESTRICTED"
+                report.isRestricted -> "RESTORE_REQUIRED"
+                else -> "APP_UNRESTRICTED"
+            },
             detail = detail,
         )
-        return Result.success(Unit)
+        return Result.success(report)
     }
 
     suspend fun setAppLimited(packageName: String, appName: String, limited: Boolean) {
@@ -395,6 +485,54 @@ class VaultRepository(
             privacyMode = NotificationPrivacyMode.SILENT_AND_HIDE,
         )
     }
+
+    suspend fun recordChannelModifiedWhileRestricted(
+        packageName: String,
+        channelInfo: com.example.restriction.DetectedChannelInfo,
+    ) {
+        deepRestrictionEngine.recordChannelModifiedWhileRestricted(packageName, channelInfo)
+    }
+
+    suspend fun inspectAllAppRestrictions(
+        installedApps: List<InstalledAppInfo>,
+    ): Map<String, PackageInspectionReport> {
+        val config = dao.getConfigOnce() ?: AdminConfigEntity()
+        val rules = dao.getLimitedAppsOnce()
+        val integrity = computeSystemIntegrityStatus(config, rules)
+        val pairs = installedApps.map { it.packageName to it.appName }
+        return deepRestrictionEngine.inspectAllKnownApps(pairs, integrity)
+    }
+
+    suspend fun inspectSingleAppRestriction(
+        packageName: String,
+        appName: String,
+        isRestricted: Boolean,
+        silentAndHide: Boolean,
+    ): PackageInspectionReport {
+        val config = dao.getConfigOnce() ?: AdminConfigEntity()
+        val rules = dao.getLimitedAppsOnce()
+        val integrity = computeSystemIntegrityStatus(config, rules)
+        return deepRestrictionEngine.inspectSingleApp(
+            packageName = packageName,
+            appName = appName,
+            isRestricted = isRestricted,
+            silentAndHide = silentAndHide,
+            integrity = integrity,
+        )
+    }
+
+    suspend fun recordGuidedSystemStepOpened(packageName: String, step: SystemRestrictionStep) {
+        deepRestrictionEngine.recordGuidedSystemStepOpened(packageName, step)
+    }
+
+    suspend fun hasRestrictedAppState(packageName: String): Boolean =
+        deepRestrictionEngine.hasRestrictedAppState(packageName)
+
+    fun buildSystemSettingsIntent(step: SystemRestrictionStep) =
+        deepRestrictionEngine.buildSystemSettingsIntent(step)
+
+    fun buildSystemSettingsIntentChain(step: SystemRestrictionStep) =
+        deepRestrictionEngine.buildSystemSettingsIntentChain(step)
 
     suspend fun grantSessionUnlock(
         packageName: String,
@@ -415,6 +553,7 @@ class VaultRepository(
         packageName: String,
         appName: String,
         decoyMode: RedirectDecoyMode = RedirectDecoyMode.ICON_DISPLAY,
+        photoPath: String? = null,
     ): Long? {
         val existing = dao.getLimitedApp(packageName) ?: return null
         val now = System.currentTimeMillis()
@@ -431,11 +570,25 @@ class VaultRepository(
             appName = appName,
             eventType = "RESTRICTED_GATE",
             detail = gateDesc,
+            photoPath = photoPath,
         )
     }
 
     suspend fun attachPhotoToEvent(eventId: Long, photoPath: String) {
         dao.updateEventPhoto(eventId, photoPath)
+    }
+
+    suspend fun attachPhotoToEvents(eventIds: Iterable<Long>, photoPath: String) {
+        if (!hasValidPhotoFile(photoPath)) return
+        eventIds.forEach { eventId ->
+            dao.updateEventPhoto(eventId, photoPath)
+        }
+    }
+
+    fun hasValidPhotoFile(photoPath: String?): Boolean {
+        if (photoPath.isNullOrBlank()) return false
+        val file = File(photoPath)
+        return file.exists() && file.length() > 0L
     }
 
     suspend fun logEvent(
@@ -469,12 +622,45 @@ class VaultRepository(
     fun getInstalledAppInfo(packageName: String): InstalledAppInfo? =
         appsProvider.getAppInfoForPackage(packageName)
 
+    fun observeSystemPermissionSettings(): Flow<Unit> = callbackFlow {
+        val cr = context.contentResolver
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                trySend(Unit)
+            }
+
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                trySend(Unit)
+            }
+        }
+        val uris = listOfNotNull(
+            Settings.Secure.getUriFor(Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES),
+            Settings.Secure.getUriFor(Settings.Secure.ACCESSIBILITY_ENABLED),
+            Settings.Secure.getUriFor("enabled_notification_listeners"),
+        )
+        uris.forEach { uri ->
+            runCatching { cr.registerContentObserver(uri, false, observer) }
+        }
+        awaitClose {
+            runCatching { cr.unregisterContentObserver(observer) }
+        }
+    }
+
     fun isAccessibilityServiceEnabled(): Boolean {
+        val accMaster = runCatching {
+            Settings.Secure.getInt(context.contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, -1)
+        }.getOrDefault(-1)
+        if (accMaster == 0) {
+            return false
+        }
         val expectedComponent = ComponentName(context, AppGuardAccessibilityService::class.java)
         val enabledServices = Settings.Secure.getString(
             context.contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-        ) ?: return AppGuardRuntimeCache.accessibilityConnected.value
+        )
+        if (enabledServices.isNullOrBlank()) {
+            return false
+        }
 
         val splitter = TextUtils.SimpleStringSplitter(':')
         splitter.setString(enabledServices)
@@ -485,7 +671,7 @@ class VaultRepository(
                 return true
             }
         }
-        return AppGuardRuntimeCache.accessibilityConnected.value
+        return false
     }
 
     fun isNotificationListenerEnabled(): Boolean {
@@ -493,23 +679,24 @@ class VaultRepository(
         val enabledListeners = Settings.Secure.getString(
             context.contentResolver,
             "enabled_notification_listeners",
-        ) ?: return AppGuardRuntimeCache.notificationListenerConnected.value
-
-        val splitter = TextUtils.SimpleStringSplitter(':')
-        splitter.setString(enabledListeners)
-        while (splitter.hasNext()) {
-            val component = ComponentName.unflattenFromString(splitter.next())
-            if (component == expected) {
+        )
+        if (!enabledListeners.isNullOrBlank()) {
+            val splitter = TextUtils.SimpleStringSplitter(':')
+            splitter.setString(enabledListeners)
+            while (splitter.hasNext()) {
+                val component = ComponentName.unflattenFromString(splitter.next())
+                if (component == expected) {
+                    return true
+                }
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            if (nm != null && runCatching { nm.isNotificationListenerAccessGranted(expected) }.getOrDefault(false)) {
                 return true
             }
         }
-        return AppGuardRuntimeCache.notificationListenerConnected.value
-    }
-
-    fun isNotificationPolicyAccessGranted(): Boolean {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return false
-        return nm.isNotificationPolicyAccessGranted
+        return false
     }
 
     fun isCameraPermissionGranted(): Boolean {
@@ -517,6 +704,14 @@ class VaultRepository(
             context,
             Manifest.permission.CAMERA,
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun hasAnyCameraHardware(): Boolean {
+        val hasFeature = context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) ||
+            context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FRONT)
+        if (!hasFeature) return false
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as? android.hardware.camera2.CameraManager
+        return runCatching { cm?.cameraIdList?.isNotEmpty() == true }.getOrDefault(true)
     }
 
     fun isPostNotificationsGranted(): Boolean {
@@ -532,5 +727,36 @@ class VaultRepository(
             ?: return false
         val adminComponent = ComponentName(context, VaultDeviceAdminReceiver::class.java)
         return dpm.isAdminActive(adminComponent)
+    }
+
+    fun isDeviceOwnerActive(): Boolean {
+        val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+            ?: return false
+        return dpm.isDeviceOwnerApp(context.packageName)
+    }
+
+    fun computeSystemIntegrityStatus(
+        config: AdminConfigEntity?,
+        limitedApps: List<LimitedAppEntity>,
+    ): SystemIntegrityStatus {
+        val effectiveConfig = config ?: AdminConfigEntity()
+        val anyMaskedAlerts = limitedApps.any {
+            it.isLimited && it.notificationPrivacyEnum == NotificationPrivacyMode.SHOW_HIDE_SENSITIVE
+        }
+        return SystemIntegrityStatus(
+            isAccessibilityEnabled = isAccessibilityServiceEnabled(),
+            isAccessibilityServiceBound = AppGuardRuntimeCache.accessibilityConnected.value,
+            isNotificationListenerEnabled = isNotificationListenerEnabled(),
+            isNotificationListenerBound = AppGuardRuntimeCache.notificationListenerConnected.value,
+            isDeviceAdminEnabled = isDeviceAdminActive(),
+            isCameraPermissionGranted = isCameraPermissionGranted(),
+            isPostNotificationsGranted = isPostNotificationsGranted(),
+            isDeviceOwnerActive = isDeviceOwnerActive(),
+            guardActive = effectiveConfig.guardActive,
+            notificationBlockEnabled = effectiveConfig.notificationBlockEnabled,
+            uninstallProtectionEnabled = effectiveConfig.uninstallProtectionEnabled,
+            capturePhotoOnOpenEnabled = effectiveConfig.capturePhotoOnOpenEnabled,
+            requiresPostNotificationsForMaskedAlerts = anyMaskedAlerts,
+        )
     }
 }

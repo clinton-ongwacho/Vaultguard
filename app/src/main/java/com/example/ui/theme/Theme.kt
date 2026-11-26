@@ -18,7 +18,7 @@ private val SkyBlueBlackWhiteColorScheme = darkColorScheme(
     onSecondaryContainer = PureWhite,
     tertiary = PureWhite,
     onTertiary = PureBlack,
-    tertiaryContainer = PureBlack,
+    tertiaryContainer = SubtleSurface,
     onTertiaryContainer = PureWhite,
     error = SkyBlue,
     onError = PureBlack,
@@ -28,17 +28,21 @@ private val SkyBlueBlackWhiteColorScheme = darkColorScheme(
     onBackground = PureWhite,
     surface = PureBlack,
     onSurface = PureWhite,
-    surfaceVariant = PureBlack,
+    surfaceContainerLow = SubtleSurface,
+    surfaceContainer = SubtleSurface,
+    surfaceContainerHigh = SkyBlueContainer,
+    surfaceVariant = SubtleSurface,
     onSurfaceVariant = PureWhite.copy(alpha = 0.72f),
-    outline = SkyBlue.copy(alpha = 0.55f),
-    outlineVariant = PureWhite.copy(alpha = 0.25f),
+    outline = PureWhite.copy(alpha = 0.22f),
+    outlineVariant = PureWhite.copy(alpha = 0.12f),
 )
 
 val VaultShapes = Shapes(
+    extraSmall = RoundedCornerShape(8.dp),
     small = RoundedCornerShape(10.dp),
-    medium = RoundedCornerShape(16.dp),
-    large = RoundedCornerShape(22.dp),
-    extraLarge = RoundedCornerShape(28.dp),
+    medium = RoundedCornerShape(14.dp),
+    large = RoundedCornerShape(18.dp),
+    extraLarge = RoundedCornerShape(24.dp),
 )
 
 @Composable

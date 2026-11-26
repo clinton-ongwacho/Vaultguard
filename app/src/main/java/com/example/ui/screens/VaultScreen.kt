@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -27,23 +28,21 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.InsertDriveFile
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AudioFile
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Image
-import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.InsertDriveFile
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
@@ -52,8 +51,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -64,6 +65,9 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -98,6 +102,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.text.DecimalFormat
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VaultScreen(
     state: VaultUiState,
@@ -249,249 +254,248 @@ fun VaultScreen(
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.TopCenter,
     ) {
-        LazyColumn(
+        Column(
             modifier = Modifier
-                .widthIn(max = 640.dp)
+                .widthIn(max = 680.dp)
                 .fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
+            TopAppBar(
+                title = {
+                    Column {
                         Text(
                             text = "Vault",
-                            style = MaterialTheme.typography.headlineMedium,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
                         )
                         Text(
                             text = "${state.vaultMediaItems.size} files",
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-
-                    Surface(
-                        color = if (state.isVaultMediaUnlocked) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surface
-                        },
-                        shape = RoundedCornerShape(14.dp),
-                        border = BorderStroke(
-                            width = 1.dp,
-                            color = if (state.isVaultMediaUnlocked) {
-                                MaterialTheme.colorScheme.primary
+                },
+                windowInsets = WindowInsets(0, 0, 0, 0),
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                ),
+                actions = {
+                    IconButton(
+                        onClick = {
+                            if (state.isVaultMediaUnlocked) {
+                                onLockVaultMedia()
                             } else {
-                                MaterialTheme.colorScheme.outline
-                            },
-                        ),
+                                pendingItemAfterUnlock = null
+                                onClearVaultUnlockError()
+                                showUnlockDialog = true
+                            }
+                        },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("vault_eye_toggle_button"),
                     ) {
-                        IconButton(
-                            onClick = {
-                                if (state.isVaultMediaUnlocked) {
-                                    onLockVaultMedia()
-                                } else {
-                                    pendingItemAfterUnlock = null
-                                    onClearVaultUnlockError()
-                                    showUnlockDialog = true
-                                }
+                        Icon(
+                            imageVector = if (state.isVaultMediaUnlocked) {
+                                Icons.Rounded.Visibility
+                            } else {
+                                Icons.Rounded.VisibilityOff
                             },
-                            modifier = Modifier.testTag("vault_eye_toggle_button"),
-                        ) {
-                            Icon(
-                                imageVector = if (state.isVaultMediaUnlocked) {
-                                    Icons.Rounded.Visibility
-                                } else {
-                                    Icons.Rounded.VisibilityOff
-                                },
-                                contentDescription = if (state.isVaultMediaUnlocked) {
-                                    "Hide Vault media"
-                                } else {
-                                    "Enter Admin password to view Vault media"
-                                },
-                                tint = MaterialTheme.colorScheme.primary,
-                            )
-                        }
-                    }
-                }
-            }
-
-            if (state.isImportingMedia) {
-                item {
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Text(
-                                text = "Encrypting…",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        }
-                    }
-                }
-            }
-
-            item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    shape = RoundedCornerShape(18.dp),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                ) {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        VaultAddListRow(
-                            icon = Icons.Rounded.Image,
-                            label = "Photos & Video",
-                            onClick = {
-                                onSuppressNextBackgroundLock()
-                                openDocumentsLauncher.launch(arrayOf("image/*", "video/*"))
+                            contentDescription = if (state.isVaultMediaUnlocked) {
+                                "Hide Vault media"
+                            } else {
+                                "Enter Admin password to view Vault media"
                             },
-                            tag = "vault_add_photos_videos_button",
+                            tint = MaterialTheme.colorScheme.primary,
                         )
-                        VaultAddListRow(
-                            icon = Icons.Rounded.MusicNote,
-                            label = "Music & Audio",
-                            onClick = {
-                                onSuppressNextBackgroundLock()
-                                openDocumentsLauncher.launch(arrayOf("audio/*"))
-                            },
-                            tag = "vault_add_audio_button",
-                        )
-                        VaultAddListRow(
-                            icon = Icons.Rounded.Description,
-                            label = "Documents",
-                            onClick = {
-                                onSuppressNextBackgroundLock()
-                                openDocumentsLauncher.launch(
-                                    arrayOf(
-                                        "application/pdf",
-                                        "text/*",
-                                        "application/msword",
-                                        "application/vnd.openxmlformats-officedocument.*",
-                                    )
+                    }
+                },
+            )
+
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (state.isImportingMedia) {
+                    item {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainer,
+                            shape = MaterialTheme.shapes.large,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "Encrypting…",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.primary,
                                 )
-                            },
-                            tag = "vault_add_documents_button",
-                        )
-                        VaultAddListRow(
-                            icon = Icons.Rounded.Add,
-                            label = "Any File",
-                            onClick = {
-                                onSuppressNextBackgroundLock()
-                                openDocumentsLauncher.launch(arrayOf("*/*"))
-                            },
-                            tag = "vault_add_any_media_button",
-                        )
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            }
+                        }
                     }
                 }
-            }
 
-            item {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    FilterChip(
-                        selected = selectedCategory == null,
-                        onClick = { selectedCategory = null },
-                        label = { Text("All (${state.vaultMediaItems.size})") },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = MaterialTheme.colorScheme.primary,
-                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
-                        ),
-                    )
-                    VaultMediaCategory.entries.forEach { cat ->
-                        val count = state.vaultMediaItems.count { it.categoryEnum == cat }
+                item {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        shape = MaterialTheme.shapes.large,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            VaultAddListRow(
+                                icon = Icons.Rounded.Image,
+                                label = "Photos & Video",
+                                onClick = {
+                                    onSuppressNextBackgroundLock()
+                                    openDocumentsLauncher.launch(arrayOf("image/*", "video/*"))
+                                },
+                                tag = "vault_add_photos_videos_button",
+                            )
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            VaultAddListRow(
+                                icon = Icons.Rounded.MusicNote,
+                                label = "Music & Audio",
+                                onClick = {
+                                    onSuppressNextBackgroundLock()
+                                    openDocumentsLauncher.launch(arrayOf("audio/*"))
+                                },
+                                tag = "vault_add_audio_button",
+                            )
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            VaultAddListRow(
+                                icon = Icons.Rounded.Description,
+                                label = "Documents",
+                                onClick = {
+                                    onSuppressNextBackgroundLock()
+                                    openDocumentsLauncher.launch(
+                                        arrayOf(
+                                            "application/pdf",
+                                            "text/*",
+                                            "application/msword",
+                                            "application/vnd.openxmlformats-officedocument.*",
+                                        )
+                                    )
+                                },
+                                tag = "vault_add_documents_button",
+                            )
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            VaultAddListRow(
+                                icon = Icons.Rounded.Add,
+                                label = "Any File",
+                                onClick = {
+                                    onSuppressNextBackgroundLock()
+                                    openDocumentsLauncher.launch(arrayOf("*/*"))
+                                },
+                                tag = "vault_add_any_media_button",
+                            )
+                        }
+                    }
+                }
+
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         FilterChip(
-                            selected = selectedCategory == cat,
-                            onClick = { selectedCategory = cat },
-                            label = { Text("${cat.label} ($count)") },
+                            selected = selectedCategory == null,
+                            onClick = { selectedCategory = null },
+                            label = { Text("All (${state.vaultMediaItems.size})") },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = MaterialTheme.colorScheme.primary,
                                 selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
                             ),
                         )
-                    }
-                }
-            }
-
-            if (externalOpenError != null) {
-                item {
-                    Surface(
-                        color = MaterialTheme.colorScheme.errorContainer,
-                        shape = RoundedCornerShape(12.dp),
-                    ) {
-                        Text(
-                            text = externalOpenError.orEmpty(),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                        )
-                    }
-                }
-            }
-
-            if (filteredItems.isEmpty()) {
-                item {
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        shape = RoundedCornerShape(18.dp),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(18.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.FolderOpen,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(28.dp),
-                            )
-                            Text(
-                                text = "Empty",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        VaultMediaCategory.entries.forEach { cat ->
+                            val count = state.vaultMediaItems.count { it.categoryEnum == cat }
+                            FilterChip(
+                                selected = selectedCategory == cat,
+                                onClick = { selectedCategory = cat },
+                                label = { Text("${cat.label} ($count)") },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+                                ),
                             )
                         }
                     }
                 }
-            } else {
-                items(filteredItems, key = { it.id }) { item ->
-                    VaultMediaRowCard(
-                        item = item,
-                        isRevealed = state.isVaultMediaUnlocked,
-                        onDecryptPhotoBytes = onDecryptPhotoBytes,
-                        onOpen = { openVaultItem(item) },
-                        onDeleteReturningToGallery = {
-                            requestUnlockOrRun {
-                                deleteCandidate = item
-                            }
-                        },
-                    )
-                }
-            }
 
-            item { Spacer(modifier = Modifier.height(10.dp)) }
+                if (externalOpenError != null) {
+                    item {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = MaterialTheme.shapes.medium,
+                        ) {
+                            Text(
+                                text = externalOpenError.orEmpty(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                            )
+                        }
+                    }
+                }
+
+                if (filteredItems.isEmpty()) {
+                    item {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainer,
+                            shape = MaterialTheme.shapes.large,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(18.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.FolderOpen,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(28.dp),
+                                )
+                                Text(
+                                    text = "Empty",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    itemsIndexed(filteredItems, key = { _, item -> item.id }) { index, item ->
+                        Column {
+                            VaultMediaRowCard(
+                                item = item,
+                                isRevealed = state.isVaultMediaUnlocked,
+                                onDecryptPhotoBytes = onDecryptPhotoBytes,
+                                onOpen = { openVaultItem(item) },
+                                onDeleteReturningToGallery = {
+                                    requestUnlockOrRun {
+                                        deleteCandidate = item
+                                    }
+                                },
+                            )
+                            if (index < filteredItems.lastIndex) {
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            }
+                        }
+                    }
+                }
+
+                item { Spacer(modifier = Modifier.height(10.dp)) }
+            }
         }
     }
 
@@ -667,86 +671,79 @@ private fun VaultMediaRowCard(
         }
     }
 
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(16.dp),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            .minimumInteractiveComponentSize()
             .clickable(onClick = onOpen)
+            .padding(vertical = 10.dp)
             .testTag("vault_item_${item.id}"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            if (isRevealed && item.categoryEnum == VaultMediaCategory.PHOTO && thumbBytes != null) {
-                AsyncImage(
-                    model = thumbBytes,
-                    contentDescription = item.displayName,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(52.dp)
-                        .clip(RoundedCornerShape(12.dp)),
-                )
-            } else {
-                Surface(
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                    modifier = Modifier.size(52.dp),
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = if (!isRevealed) {
-                                Icons.Rounded.VisibilityOff
-                            } else {
-                                when (item.categoryEnum) {
-                                    VaultMediaCategory.PHOTO -> Icons.Rounded.Image
-                                    VaultMediaCategory.VIDEO -> Icons.Rounded.VideoLibrary
-                                    VaultMediaCategory.AUDIO -> Icons.Rounded.AudioFile
-                                    VaultMediaCategory.DOCUMENT -> Icons.Rounded.Description
-                                    VaultMediaCategory.OTHER -> Icons.Rounded.InsertDriveFile
-                                }
-                            },
-                            contentDescription = if (isRevealed) item.categoryEnum.label else "Hidden media",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(26.dp),
-                        )
-                    }
-                }
-            }
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = if (isRevealed) item.displayName else "${item.categoryEnum.label} ••••",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = "${item.categoryEnum.label} • ${formatMediaBytes(item.sizeBytes)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            if (isRevealed) {
-                IconButton(
-                    onClick = onDeleteReturningToGallery,
-                    modifier = Modifier.testTag("vault_delete_${item.id}"),
-                ) {
+        if (isRevealed && item.categoryEnum == VaultMediaCategory.PHOTO && thumbBytes != null) {
+            AsyncImage(
+                model = thumbBytes,
+                contentDescription = item.displayName,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(10.dp)),
+            )
+        } else {
+            Surface(
+                color = MaterialTheme.colorScheme.primaryContainer,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.size(48.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
                     Icon(
-                        imageVector = Icons.Rounded.DeleteOutline,
-                        contentDescription = "Remove from Vault and return to gallery",
+                        imageVector = if (!isRevealed) {
+                            Icons.Rounded.VisibilityOff
+                        } else {
+                            when (item.categoryEnum) {
+                                VaultMediaCategory.PHOTO -> Icons.Rounded.Image
+                                VaultMediaCategory.VIDEO -> Icons.Rounded.VideoLibrary
+                                VaultMediaCategory.AUDIO -> Icons.Rounded.AudioFile
+                                VaultMediaCategory.DOCUMENT -> Icons.Rounded.Description
+                                VaultMediaCategory.OTHER -> Icons.AutoMirrored.Rounded.InsertDriveFile
+                            }
+                        },
+                        contentDescription = if (isRevealed) item.categoryEnum.label else "Hidden media",
                         tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(24.dp),
                     )
                 }
+            }
+        }
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = if (isRevealed) item.displayName else "${item.categoryEnum.label} ••••",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "${item.categoryEnum.label} • ${formatMediaBytes(item.sizeBytes)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (isRevealed) {
+            IconButton(
+                onClick = onDeleteReturningToGallery,
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .testTag("vault_delete_${item.id}"),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.DeleteOutline,
+                    contentDescription = "Remove from Vault and return to gallery",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
             }
         }
     }

@@ -8,8 +8,15 @@ import androidx.room.Transaction
 import com.example.data.entity.AccessEventEntity
 import com.example.data.entity.AdminConfigEntity
 import com.example.data.entity.LimitedAppEntity
+import com.example.data.entity.RestrictedAppStateEntity
 import com.example.data.entity.SecurityQuestionEntity
 import kotlinx.coroutines.flow.Flow
+
+data class AppRestrictionFrequency(
+    val packageName: String,
+    val eventCount: Int,
+    val lastEventAtMillis: Long,
+)
 
 @Dao
 interface VaultDao {
@@ -37,8 +44,34 @@ interface VaultDao {
     @Query("DELETE FROM limited_apps WHERE packageName = :packageName")
     suspend fun deleteLimitedApp(packageName: String)
 
+    @Query("SELECT * FROM restricted_app_states")
+    fun observeRestrictedAppStates(): Flow<List<RestrictedAppStateEntity>>
+
+    @Query("SELECT * FROM restricted_app_states")
+    suspend fun getRestrictedAppStatesOnce(): List<RestrictedAppStateEntity>
+
+    @Query("SELECT * FROM restricted_app_states WHERE packageName = :packageName LIMIT 1")
+    suspend fun getRestrictedAppState(packageName: String): RestrictedAppStateEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertRestrictedAppState(state: RestrictedAppStateEntity)
+
+    @Query("DELETE FROM restricted_app_states WHERE packageName = :packageName")
+    suspend fun deleteRestrictedAppState(packageName: String)
+
     @Query("SELECT * FROM access_events ORDER BY timestampMillis DESC LIMIT 60")
     fun observeRecentEvents(): Flow<List<AccessEventEntity>>
+
+    @Query(
+        """
+        SELECT packageName, COUNT(*) AS eventCount, MAX(timestampMillis) AS lastEventAtMillis
+        FROM access_events
+        WHERE eventType IN ('APP_RESTRICTED', 'RESTRICTED_GATE', 'SESSION_UNLOCKED')
+        GROUP BY packageName
+        ORDER BY eventCount DESC, lastEventAtMillis DESC
+        """
+    )
+    fun observeRestrictionEventFrequencies(): Flow<List<AppRestrictionFrequency>>
 
     @Insert
     suspend fun insertEvent(event: AccessEventEntity): Long
